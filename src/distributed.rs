@@ -1,0 +1,402 @@
+//! In-process distributed runner.
+//!
+//! This is intentionally a transport-free prototype: it schedules partition tasks onto a
+//! bounded worker pool, produces Arrow partial aggregates, performs an in-memory exchange,
+//! and merges them. Replacing the task and exchange adapters with RPC/Arrow Flight is the
+//! next scaling step; the physical operators do not change.
+
+use crate::error::{Result, SparkXError};
+use crate::execution::{PhysicalPlan, TaskContext, execute, hash_aggregate};
+use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
+use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+#[derive(Debug, Clone)]
+pub struct LocalCluster {
+    workers: usize,
+}
+
+#[derive(Debug)]
+pub struct ClusterResult {
+    pub batches: Vec<RecordBatch>,
+    pub distributed: bool,
+    pub stages: usize,
+}
+
+impl LocalCluster {
+    pub fn new(workers: usize) -> Self {
+        Self {
+            workers: workers.max(1),
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        plan: Arc<PhysicalPlan>,
+        context: TaskContext,
+    ) -> Result<ClusterResult> {
+        let PhysicalPlan::HashAggregate {
+            input,
+            group_exprs,
+            aggregate_exprs,
+            schema,
+        } = plan.as_ref()
+        else {
+            return Ok(ClusterResult {
+                batches: execute(plan, context).collect().await?,
+                distributed: false,
+                stages: 1,
+            });
+        };
+
+        if contains_join(input) {
+            return Ok(ClusterResult {
+                batches: execute(plan, context).collect().await?,
+                distributed: false,
+                stages: 1,
+            });
+        }
+        if aggregate_exprs.iter().any(is_distinct_aggregate) {
+            return Ok(ClusterResult {
+                batches: execute(plan, context).collect().await?,
+                distributed: false,
+                stages: 1,
+            });
+        }
+        let Some(partitions) = scan_partitions(input) else {
+            return Ok(ClusterResult {
+                batches: execute(plan, context).collect().await?,
+                distributed: false,
+                stages: 1,
+            });
+        };
+        if partitions <= 1 {
+            return Ok(ClusterResult {
+                batches: execute(plan, context).collect().await?,
+                distributed: false,
+                stages: 1,
+            });
+        }
+
+        let partial_exprs = partial_aggregate_exprs(aggregate_exprs)?;
+        let partial_schema = aggregate_schema(input.schema(), group_exprs, &partial_exprs)?;
+        let semaphore = Arc::new(Semaphore::new(self.workers));
+        let mut tasks = JoinSet::new();
+
+        for partition in 0..partitions {
+            let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
+                SparkXError::execution("local cluster worker pool closed unexpectedly")
+            })?;
+            let input = input.clone();
+            let group_exprs = group_exprs.clone();
+            let partial_exprs = partial_exprs.clone();
+            let partial_schema = partial_schema.clone();
+            let mut task_context = context.clone();
+            task_context.partition = Some(partition);
+            tasks.spawn(async move {
+                let _permit = permit;
+                let batches = execute(input, task_context).collect().await?;
+                hash_aggregate(&batches, &group_exprs, &partial_exprs, partial_schema)
+            });
+        }
+
+        let mut partial_batches = Vec::with_capacity(partitions);
+        while let Some(result) = tasks.join_next().await {
+            let batch = result.map_err(|error| {
+                SparkXError::execution(format!("worker task failed: {error}"))
+            })??;
+            context.metrics.add_shuffled_rows(batch.num_rows());
+            partial_batches.push(batch);
+        }
+        let final_batch = merge_partials(
+            &partial_batches,
+            group_exprs.len(),
+            aggregate_exprs,
+            schema.clone(),
+        )?;
+        Ok(ClusterResult {
+            batches: vec![final_batch],
+            distributed: true,
+            stages: 2,
+        })
+    }
+}
+
+fn is_distinct_aggregate(expr: &Expr) -> bool {
+    matches!(expr.unalias(), Expr::Aggregate { distinct: true, .. })
+}
+
+fn contains_join(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::HashJoin { .. } => true,
+        PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. } => contains_join(input),
+        PhysicalPlan::Scan { .. } => false,
+    }
+}
+
+fn scan_partitions(plan: &PhysicalPlan) -> Option<usize> {
+    match plan {
+        PhysicalPlan::Scan { provider, .. } => Some(provider.partition_count()),
+        PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. } => scan_partitions(input),
+        PhysicalPlan::HashJoin { .. } => None,
+    }
+}
+
+fn aggregate_schema(
+    input_schema: SchemaRef,
+    groups: &[Expr],
+    aggregates: &[Expr],
+) -> Result<SchemaRef> {
+    let fields = groups
+        .iter()
+        .chain(aggregates)
+        .map(|expr| expr.field(input_schema.as_ref()))
+        .collect::<Result<Vec<Field>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn partial_aggregate_exprs(aggregates: &[Expr]) -> Result<Vec<Expr>> {
+    let mut partials = Vec::new();
+    for (index, aggregate) in aggregates.iter().enumerate() {
+        let alias = aggregate.name();
+        let Expr::Aggregate {
+            function,
+            expr,
+            distinct,
+        } = aggregate.unalias()
+        else {
+            return Err(SparkXError::planning(format!(
+                "expected aggregate expression, got {aggregate}"
+            )));
+        };
+        if *function == AggregateFunction::Avg {
+            partials.push(
+                Expr::Aggregate {
+                    function: AggregateFunction::Sum,
+                    expr: expr.clone(),
+                    distinct: *distinct,
+                }
+                .alias(format!("__sparkx_avg_sum_{index}")),
+            );
+            partials.push(
+                Expr::Aggregate {
+                    function: AggregateFunction::Count,
+                    expr: expr.clone(),
+                    distinct: *distinct,
+                }
+                .alias(format!("__sparkx_avg_count_{index}")),
+            );
+        } else {
+            partials.push(aggregate.unalias().clone().alias(alias));
+        }
+    }
+    Ok(partials)
+}
+
+#[derive(Debug, Clone)]
+enum MergeState {
+    Count(u64),
+    Sum { value: f64, seen: bool },
+    Min(Option<ScalarValue>),
+    Max(Option<ScalarValue>),
+    Avg { sum: f64, count: u64 },
+}
+
+fn merge_partials(
+    batches: &[RecordBatch],
+    group_count: usize,
+    aggregates: &[Expr],
+    schema: SchemaRef,
+) -> Result<RecordBatch> {
+    let functions = aggregates
+        .iter()
+        .map(|expr| match expr.unalias() {
+            Expr::Aggregate { function, .. } => Ok(*function),
+            other => Err(SparkXError::planning(format!(
+                "expected aggregate expression, got {other}"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut groups: HashMap<Vec<ScalarValue>, Vec<MergeState>> = HashMap::new();
+    if group_count == 0 {
+        groups.insert(Vec::new(), new_merge_states(&functions));
+    }
+
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let key = (0..group_count)
+                .map(|column| value_at(batch.column(column).as_ref(), row))
+                .collect::<Result<Vec<_>>>()?;
+            let states = groups
+                .entry(key)
+                .or_insert_with(|| new_merge_states(&functions));
+            let mut column = group_count;
+            for (function, state) in functions.iter().zip(states.iter_mut()) {
+                match (function, state) {
+                    (AggregateFunction::Count, MergeState::Count(total)) => {
+                        *total += as_u64(&value_at(batch.column(column).as_ref(), row)?)?;
+                        column += 1;
+                    }
+                    (AggregateFunction::Sum, MergeState::Sum { value, seen }) => {
+                        let partial = value_at(batch.column(column).as_ref(), row)?;
+                        if partial != ScalarValue::Null {
+                            *value += as_f64(&partial)?;
+                            *seen = true;
+                        }
+                        column += 1;
+                    }
+                    (AggregateFunction::Min, MergeState::Min(current)) => {
+                        merge_extreme(
+                            current,
+                            value_at(batch.column(column).as_ref(), row)?,
+                            true,
+                        )?;
+                        column += 1;
+                    }
+                    (AggregateFunction::Max, MergeState::Max(current)) => {
+                        merge_extreme(
+                            current,
+                            value_at(batch.column(column).as_ref(), row)?,
+                            false,
+                        )?;
+                        column += 1;
+                    }
+                    (AggregateFunction::Avg, MergeState::Avg { sum, count }) => {
+                        *sum += as_f64(&value_at(batch.column(column).as_ref(), row)?)?;
+                        *count += as_u64(&value_at(batch.column(column + 1).as_ref(), row)?)?;
+                        column += 2;
+                    }
+                    _ => return Err(SparkXError::execution("invalid partial aggregate state")),
+                }
+            }
+        }
+    }
+
+    let mut entries = groups.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| compare_keys(left, right));
+    let mut columns = vec![Vec::with_capacity(entries.len()); schema.fields().len()];
+    for (key, states) in entries {
+        for (index, value) in key.into_iter().enumerate() {
+            columns[index].push(value);
+        }
+        for (index, state) in states.into_iter().enumerate() {
+            let value = match state {
+                MergeState::Count(value) => ScalarValue::UInt64(value),
+                MergeState::Sum { value, seen } => {
+                    if seen {
+                        ScalarValue::Float64(value)
+                    } else {
+                        ScalarValue::Null
+                    }
+                }
+                MergeState::Min(value) | MergeState::Max(value) => {
+                    value.unwrap_or(ScalarValue::Null)
+                }
+                MergeState::Avg { sum, count } => {
+                    if count == 0 {
+                        ScalarValue::Null
+                    } else {
+                        ScalarValue::Float64(sum / count as f64)
+                    }
+                }
+            };
+            columns[group_count + index].push(value);
+        }
+    }
+    let arrays = columns
+        .iter()
+        .zip(schema.fields())
+        .map(|(values, field)| scalars_to_array(values, field.data_type()))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+fn new_merge_states(functions: &[AggregateFunction]) -> Vec<MergeState> {
+    functions
+        .iter()
+        .map(|function| match function {
+            AggregateFunction::Count => MergeState::Count(0),
+            AggregateFunction::Sum => MergeState::Sum {
+                value: 0.0,
+                seen: false,
+            },
+            AggregateFunction::Min => MergeState::Min(None),
+            AggregateFunction::Max => MergeState::Max(None),
+            AggregateFunction::Avg => MergeState::Avg { sum: 0.0, count: 0 },
+        })
+        .collect()
+}
+
+fn as_f64(value: &ScalarValue) -> Result<f64> {
+    match value {
+        ScalarValue::Float64(value) => Ok(*value),
+        ScalarValue::Int64(value) => Ok(*value as f64),
+        ScalarValue::UInt64(value) => Ok(*value as f64),
+        ScalarValue::Null => Ok(0.0),
+        other => Err(SparkXError::execution(format!(
+            "expected numeric partial, got {other:?}"
+        ))),
+    }
+}
+
+fn as_u64(value: &ScalarValue) -> Result<u64> {
+    match value {
+        ScalarValue::UInt64(value) => Ok(*value),
+        ScalarValue::Int64(value) if *value >= 0 => Ok(*value as u64),
+        ScalarValue::Null => Ok(0),
+        other => Err(SparkXError::execution(format!(
+            "expected unsigned partial, got {other:?}"
+        ))),
+    }
+}
+
+fn merge_extreme(
+    current: &mut Option<ScalarValue>,
+    candidate: ScalarValue,
+    minimum: bool,
+) -> Result<()> {
+    if candidate == ScalarValue::Null {
+        return Ok(());
+    }
+    let replace = match current {
+        None => true,
+        Some(value) => match candidate.partial_compare(value) {
+            Some(Ordering::Less) => minimum,
+            Some(Ordering::Greater) => !minimum,
+            Some(Ordering::Equal) => false,
+            None => {
+                return Err(SparkXError::execution(
+                    "partial aggregate types cannot be compared",
+                ));
+            }
+        },
+    };
+    if replace {
+        *current = Some(candidate);
+    }
+    Ok(())
+}
+
+fn compare_keys(left: &[ScalarValue], right: &[ScalarValue]) -> Ordering {
+    for (left, right) in left.iter().zip(right) {
+        match left.partial_compare(right) {
+            Some(Ordering::Equal) => continue,
+            Some(ordering) => return ordering,
+            None => return Ordering::Equal,
+        }
+    }
+    left.len().cmp(&right.len())
+}

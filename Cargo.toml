@@ -1,0 +1,42 @@
+[package]
+name = "sparkx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A scrappy Arrow-native distributed query engine prototype in Rust"
+license = "Apache-2.0"
+
+[lib]
+name = "sparkx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sparkx"
+path = "src/bin/sparkx.rs"
+
+[[bench]]
+name = "engine"
+harness = false
+
+[dependencies]
+arrow = { version = "59.1.0", features = ["csv", "ipc", "prettyprint"] }
+clap = { version = "4.5.46", features = ["derive"] }
+num_cpus = "1.17.0"
+parquet = { version = "59.1.0", features = ["arrow"] }
+parking_lot = "0.12.4"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sqlparser = "0.62.0"
+thiserror = "2.0.16"
+tokio = { version = "1.53.1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+tempfile = "3.21.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.bench]
+debug = true
