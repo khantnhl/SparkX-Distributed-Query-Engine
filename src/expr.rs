@@ -374,18 +374,18 @@ pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
                 right = cast(&right, &target)?;
             }
             let result: ArrayRef = match op {
-                Operator::Eq => Arc::new(cmp::eq(left.as_ref(), right.as_ref())?),
-                Operator::NotEq => Arc::new(cmp::neq(left.as_ref(), right.as_ref())?),
-                Operator::Lt => Arc::new(cmp::lt(left.as_ref(), right.as_ref())?),
-                Operator::LtEq => Arc::new(cmp::lt_eq(left.as_ref(), right.as_ref())?),
-                Operator::Gt => Arc::new(cmp::gt(left.as_ref(), right.as_ref())?),
-                Operator::GtEq => Arc::new(cmp::gt_eq(left.as_ref(), right.as_ref())?),
+                Operator::Eq => Arc::new(cmp::eq(&left.as_ref(), &right.as_ref())?),
+                Operator::NotEq => Arc::new(cmp::neq(&left.as_ref(), &right.as_ref())?),
+                Operator::Lt => Arc::new(cmp::lt(&left.as_ref(), &right.as_ref())?),
+                Operator::LtEq => Arc::new(cmp::lt_eq(&left.as_ref(), &right.as_ref())?),
+                Operator::Gt => Arc::new(cmp::gt(&left.as_ref(), &right.as_ref())?),
+                Operator::GtEq => Arc::new(cmp::gt_eq(&left.as_ref(), &right.as_ref())?),
                 Operator::And => Arc::new(boolean::and(as_boolean(&left)?, as_boolean(&right)?)?),
                 Operator::Or => Arc::new(boolean::or(as_boolean(&left)?, as_boolean(&right)?)?),
-                Operator::Add => numeric::add(left.as_ref(), right.as_ref())?,
-                Operator::Subtract => numeric::sub(left.as_ref(), right.as_ref())?,
-                Operator::Multiply => numeric::mul(left.as_ref(), right.as_ref())?,
-                Operator::Divide => numeric::div(left.as_ref(), right.as_ref())?,
+                Operator::Add => numeric::add(&left.as_ref(), &right.as_ref())?,
+                Operator::Subtract => numeric::sub(&left.as_ref(), &right.as_ref())?,
+                Operator::Multiply => numeric::mul(&left.as_ref(), &right.as_ref())?,
+                Operator::Divide => numeric::div(&left.as_ref(), &right.as_ref())?,
             };
             Ok(result)
         }

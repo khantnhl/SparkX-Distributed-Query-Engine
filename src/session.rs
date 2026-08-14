@@ -304,7 +304,7 @@ impl Session {
                 JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
                     (JoinType::Left, constraint)
                 }
-                other => return Err(SparkXError::unsupported(format!("join operator {other}"))),
+                other => return Err(SparkXError::unsupported(format!("join operator {other:?}"))),
             };
             let JoinConstraint::On(condition) = constraint else {
                 return Err(SparkXError::unsupported(

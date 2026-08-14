@@ -175,15 +175,15 @@ impl LogicalPlan {
             .collect();
         for field in right.schema().fields() {
             let mut output = field.as_ref().clone();
+            if join_type == JoinType::Left {
+                output = output.with_nullable(true);
+            }
             if fields
                 .iter()
                 .any(|existing| existing.name() == output.name())
             {
-                output = Field::new(
-                    format!("right.{}", output.name()),
-                    output.data_type().clone(),
-                    true,
-                );
+                let output_name = format!("right.{}", output.name());
+                output = output.with_name(output_name);
             }
             fields.push(output);
         }

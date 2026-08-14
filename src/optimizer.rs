@@ -70,7 +70,8 @@ fn eliminate_identity_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
             .zip(schema.fields())
             .all(|(expr, field)| match expr.unalias() {
                 Expr::Column(name) => {
-                    expr.name() == field.name() && crate::expr::unqualified(name) == field.name()
+                    expr.name().as_str() == field.name().as_str()
+                        && crate::expr::unqualified(name) == field.name().as_str()
                 }
                 _ => false,
             });
