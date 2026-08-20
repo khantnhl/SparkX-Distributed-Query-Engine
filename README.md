@@ -20,7 +20,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Concurrent partition scans and a worker-limited local cluster
 - Two-stage partial/final distributed aggregation with an Arrow exchange boundary
 - Logical, optimized, and physical plan explanations
-- Query/task/scan/shuffle/timing metrics
+- Stable per-operator IDs, output/timing metrics, and cooperative query cancellation
 - Integration tests and Criterion micro/pipeline benchmarks
 
 ## Quick start
@@ -53,8 +53,8 @@ cargo run --example programmatic
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-cargo bench --bench engine
+cargo test --locked --all-targets
+cargo bench --locked --bench engine
 ```
 
 On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion suite and records machine metadata next to Criterion's reports.
@@ -75,6 +75,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `benches/engine.rs` | Expression and end-to-end Criterion benchmarks |
 | `tests/engine.rs` | SQL, optimizer, I/O, join, and distributed correctness tests |
 | `docs/ARCHITECTURE.md` | End-to-end HLD and component workflows |
+| `docs/SQL_SUPPORT.md` | Tested SQL features, primitive types, coercions, and distributed eligibility |
 | `docs/BENCHMARKS.md` | Benchmark matrix, method, and interpretation |
 | `docs/ROADMAP.md` | Concrete path from prototype to serious engine |
 

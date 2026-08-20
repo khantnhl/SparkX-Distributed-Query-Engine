@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::expr::{Expr, find_column};
-use crate::logical::LogicalPlan;
+use crate::logical::{LogicalPlan, SortExpr};
 use arrow::datatypes::Schema;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ pub struct Optimizer;
 impl Optimizer {
     pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let plan = self.optimize_children(plan)?;
+        let plan = simplify_expressions(plan)?;
         let plan = push_filter_into_scan(plan)?;
         let plan = push_projection_into_scan(plan)?;
         eliminate_identity_projection(plan)
@@ -56,6 +57,97 @@ impl Optimizer {
                 right_on,
             ),
         }
+    }
+}
+
+fn simplify_expressions(plan: LogicalPlan) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Scan {
+            table,
+            projection,
+            filters,
+            schema,
+        } => Ok(LogicalPlan::Scan {
+            table,
+            projection,
+            filters: filters
+                .iter()
+                .map(|expr| expr.simplify(schema.as_ref()))
+                .collect::<Result<Vec<_>>>()?,
+            schema,
+        }),
+        LogicalPlan::Projection { input, exprs, .. } => {
+            let schema = input.schema();
+            LogicalPlan::project(
+                (*input).clone(),
+                exprs
+                    .iter()
+                    .map(|expr| expr.simplify(schema.as_ref()))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
+            let predicate = predicate.simplify(input.schema().as_ref())?;
+            LogicalPlan::filter((*input).clone(), predicate)
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            aggregate_exprs,
+            ..
+        } => {
+            let schema = input.schema();
+            LogicalPlan::aggregate(
+                (*input).clone(),
+                group_exprs
+                    .iter()
+                    .map(|expr| expr.simplify(schema.as_ref()))
+                    .collect::<Result<Vec<_>>>()?,
+                aggregate_exprs
+                    .iter()
+                    .map(|expr| expr.simplify(schema.as_ref()))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            let schema = input.schema();
+            LogicalPlan::sort(
+                (*input).clone(),
+                exprs
+                    .iter()
+                    .map(|sort| {
+                        Ok(SortExpr {
+                            expr: sort.expr.simplify(schema.as_ref())?,
+                            ascending: sort.ascending,
+                            nulls_first: sort.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        LogicalPlan::Limit { input, limit, .. } => Ok(LogicalPlan::limit((*input).clone(), limit)),
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            left_on,
+            right_on,
+            ..
+        } => LogicalPlan::join(
+            (*left).clone(),
+            (*right).clone(),
+            join_type,
+            left_on
+                .iter()
+                .map(|expr| expr.simplify(left.schema().as_ref()))
+                .collect::<Result<Vec<_>>>()?,
+            right_on
+                .iter()
+                .map(|expr| expr.simplify(right.schema().as_ref()))
+                .collect::<Result<Vec<_>>>()?,
+        ),
     }
 }
 

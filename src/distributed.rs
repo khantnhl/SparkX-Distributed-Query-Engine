@@ -13,6 +13,7 @@ use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -40,7 +41,9 @@ impl LocalCluster {
         plan: Arc<PhysicalPlan>,
         context: TaskContext,
     ) -> Result<ClusterResult> {
+        context.cancellation.check()?;
         let PhysicalPlan::HashAggregate {
+            id,
             input,
             group_exprs,
             aggregate_exprs,
@@ -83,12 +86,14 @@ impl LocalCluster {
             });
         }
 
+        let started = Instant::now();
         let partial_exprs = partial_aggregate_exprs(aggregate_exprs)?;
         let partial_schema = aggregate_schema(input.schema(), group_exprs, &partial_exprs)?;
         let semaphore = Arc::new(Semaphore::new(self.workers));
         let mut tasks = JoinSet::new();
 
         for partition in 0..partitions {
+            context.cancellation.check()?;
             let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                 SparkXError::execution("local cluster worker pool closed unexpectedly")
             })?;
@@ -100,25 +105,36 @@ impl LocalCluster {
             task_context.partition = Some(partition);
             tasks.spawn(async move {
                 let _permit = permit;
+                task_context.cancellation.check()?;
+                let cancellation = task_context.cancellation.clone();
                 let batches = execute(input, task_context).collect().await?;
+                cancellation.check()?;
                 hash_aggregate(&batches, &group_exprs, &partial_exprs, partial_schema)
             });
         }
 
         let mut partial_batches = Vec::with_capacity(partitions);
         while let Some(result) = tasks.join_next().await {
+            context.cancellation.check()?;
             let batch = result.map_err(|error| {
                 SparkXError::execution(format!("worker task failed: {error}"))
             })??;
             context.metrics.add_shuffled_rows(batch.num_rows());
             partial_batches.push(batch);
         }
+        context.cancellation.check()?;
         let final_batch = merge_partials(
             &partial_batches,
             group_exprs.len(),
             aggregate_exprs,
             schema.clone(),
         )?;
+        context
+            .metrics
+            .record_operator_output(*id, "HashAggregate", final_batch.num_rows());
+        context
+            .metrics
+            .add_operator_elapsed(*id, "HashAggregate", started.elapsed());
         Ok(ClusterResult {
             batches: vec![final_batch],
             distributed: true,

@@ -1,3 +1,4 @@
+use crate::cancellation::CancellationToken;
 use crate::catalog::{Catalog, CsvTable, MemoryTable, ParquetTable, TableRef};
 use crate::distributed::LocalCluster;
 use crate::error::{Result, SparkXError};
@@ -7,11 +8,13 @@ use crate::logical::{JoinType, LogicalPlan, SortExpr};
 use crate::metrics::{MetricsSnapshot, QueryMetrics};
 use crate::optimizer::Optimizer;
 use crate::planner::PhysicalPlanner;
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, OrderByKind, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
+    BinaryOperator, CastKind, DataType as SqlDataType, DuplicateTreatment, Expr as SqlExpr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -64,7 +67,6 @@ pub struct Session {
     config: SessionConfig,
     catalog: Arc<Catalog>,
     optimizer: Optimizer,
-    physical_planner: PhysicalPlanner,
 }
 
 impl Session {
@@ -79,7 +81,6 @@ impl Session {
             config,
             catalog: Arc::new(Catalog::default()),
             optimizer: Optimizer,
-            physical_planner: PhysicalPlanner,
         }
     }
 
@@ -127,9 +128,7 @@ impl Session {
     pub fn explain(&self, sql: &str) -> Result<String> {
         let logical = self.sql(sql)?;
         let optimized = self.optimizer.optimize(logical.clone())?;
-        let physical = self
-            .physical_planner
-            .create_physical_plan(&optimized, &self.catalog)?;
+        let physical = PhysicalPlanner::create_physical_plan(&optimized, &self.catalog)?;
         Ok(format!(
             "== Logical Plan ==\n{}\n== Optimized Logical Plan ==\n{}\n== Physical Plan ==\n{}",
             logical.explain(),
@@ -139,16 +138,35 @@ impl Session {
     }
 
     pub async fn execute_sql(&self, sql: &str) -> Result<QueryResult> {
-        self.execute_plan(self.sql(sql)?).await
+        self.execute_sql_with_cancellation(sql, CancellationToken::new())
+            .await
+    }
+
+    pub async fn execute_sql_with_cancellation(
+        &self,
+        sql: &str,
+        cancellation: CancellationToken,
+    ) -> Result<QueryResult> {
+        cancellation.check()?;
+        self.execute_plan_with_cancellation(self.sql(sql)?, cancellation)
+            .await
     }
 
     pub async fn execute_plan(&self, logical: LogicalPlan) -> Result<QueryResult> {
+        self.execute_plan_with_cancellation(logical, CancellationToken::new())
+            .await
+    }
+
+    pub async fn execute_plan_with_cancellation(
+        &self,
+        logical: LogicalPlan,
+        cancellation: CancellationToken,
+    ) -> Result<QueryResult> {
+        cancellation.check()?;
         let logical_text = logical.explain();
         let optimized = self.optimizer.optimize(logical)?;
         let optimized_text = optimized.explain();
-        let physical = self
-            .physical_planner
-            .create_physical_plan(&optimized, &self.catalog)?;
+        let physical = PhysicalPlanner::create_physical_plan(&optimized, &self.catalog)?;
         let physical_text = physical.explain();
         let metrics = Arc::new(QueryMetrics::default());
         let context = TaskContext {
@@ -156,6 +174,7 @@ impl Session {
             channel_capacity: self.config.channel_capacity,
             partition: None,
             metrics: metrics.clone(),
+            cancellation,
         };
         let started = Instant::now();
         let (batches, distributed, stages) = if self.config.distributed {
@@ -290,13 +309,16 @@ impl Session {
 
     fn plan_from(&self, from: &TableWithJoins) -> Result<LogicalPlan> {
         if from.joins.len() > 1 {
-            return Err(SparkXError::unsupported(
-                "more than one JOIN in a SELECT",
-            ));
+            return Err(SparkXError::unsupported("more than one JOIN in a SELECT"));
         }
         let (mut plan, left_qualifier) = self.table_factor(&from.relation)?;
         for join in &from.joins {
             let (right, right_qualifier) = self.table_factor(&join.relation)?;
+            if left_qualifier == right_qualifier {
+                return Err(SparkXError::planning(format!(
+                    "table qualifier '{left_qualifier}' is used more than once; add unique aliases"
+                )));
+            }
             let (join_type, constraint) = match &join.join_operator {
                 JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
                     (JoinType::Inner, constraint)
@@ -316,16 +338,33 @@ impl Session {
             let mut left_on = Vec::new();
             let mut right_on = Vec::new();
             for (left, right_expr) in pairs {
-                let left_is_right = expression_qualifier(&left)
-                    .is_some_and(|qualifier| qualifier == right_qualifier);
-                let right_is_left = expression_qualifier(&right_expr)
-                    .is_some_and(|qualifier| qualifier == left_qualifier);
-                if left_is_right || right_is_left {
-                    left_on.push(Self::sql_expr(&right_expr)?);
-                    right_on.push(Self::sql_expr(&left)?);
-                } else {
-                    left_on.push(Self::sql_expr(&left)?);
-                    right_on.push(Self::sql_expr(&right_expr)?);
+                let left_expr = Self::sql_expr(&left)?;
+                let right_expr = Self::sql_expr(&right_expr)?;
+                match (
+                    join_expression_side(
+                        &left_expr,
+                        plan.schema().as_ref(),
+                        right.schema().as_ref(),
+                    )?,
+                    join_expression_side(
+                        &right_expr,
+                        plan.schema().as_ref(),
+                        right.schema().as_ref(),
+                    )?,
+                ) {
+                    (JoinSide::Left, JoinSide::Right) => {
+                        left_on.push(left_expr);
+                        right_on.push(right_expr);
+                    }
+                    (JoinSide::Right, JoinSide::Left) => {
+                        left_on.push(right_expr);
+                        right_on.push(left_expr);
+                    }
+                    _ => {
+                        return Err(SparkXError::planning(
+                            "JOIN equality operands must reference opposite table sides",
+                        ));
+                    }
                 }
             }
             plan = LogicalPlan::join(plan, right, join_type, left_on, right_on)?;
@@ -349,7 +388,8 @@ impl Session {
             .map(|alias| alias.name.value.clone())
             .unwrap_or_else(|| table.clone());
         let provider = self.catalog.table(&table)?;
-        Ok((LogicalPlan::scan(table, provider.schema()), qualifier))
+        let schema = qualify_schema(provider.schema().as_ref(), &qualifier);
+        Ok((LogicalPlan::scan(table, schema), qualifier))
     }
 
     fn select_item(&self, item: &SelectItem) -> Result<Expr> {
@@ -380,6 +420,23 @@ impl Session {
             )),
             SqlExpr::Value(value) => sql_value(&value.value),
             SqlExpr::Nested(expr) => Self::sql_expr(expr),
+            SqlExpr::IsNull(expr) => Ok(Expr::is_null(Self::sql_expr(expr)?, false)),
+            SqlExpr::IsNotNull(expr) => Ok(Expr::is_null(Self::sql_expr(expr)?, true)),
+            SqlExpr::Cast {
+                kind,
+                expr,
+                data_type,
+                array,
+                format,
+            } => {
+                if *array || format.is_some() {
+                    return Err(SparkXError::unsupported("CAST ARRAY/FORMAT options"));
+                }
+                if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
+                    return Err(SparkXError::unsupported(format!("cast kind {kind:?}")));
+                }
+                Ok(Expr::cast(Self::sql_expr(expr)?, sql_data_type(data_type)?))
+            }
             SqlExpr::BinaryOp { left, op, right } => Ok(Expr::binary(
                 Self::sql_expr(left)?,
                 sql_operator(op)?,
@@ -451,6 +508,40 @@ impl Session {
     }
 }
 
+fn qualify_schema(schema: &Schema, qualifier: &str) -> SchemaRef {
+    Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_name(format!("{qualifier}.{}", field.name()))
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+fn join_expression_side(expr: &Expr, left: &Schema, right: &Schema) -> Result<JoinSide> {
+    match (expr.data_type(left).is_ok(), expr.data_type(right).is_ok()) {
+        (true, false) => Ok(JoinSide::Left),
+        (false, true) => Ok(JoinSide::Right),
+        (true, true) => Err(SparkXError::planning(format!(
+            "JOIN expression {expr} is ambiguous; qualify its columns with a table name or alias"
+        ))),
+        (false, false) => Err(SparkXError::planning(format!(
+            "JOIN expression {expr} does not resolve to either input"
+        ))),
+    }
+}
+
 fn sql_operator(operator: &BinaryOperator) -> Result<Operator> {
     Ok(match operator {
         BinaryOperator::Eq => Operator::Eq,
@@ -489,6 +580,64 @@ fn sql_value(value: &Value) -> Result<Expr> {
         other => return Err(SparkXError::unsupported(format!("literal {other}"))),
     };
     Ok(Expr::literal(scalar))
+}
+
+fn sql_data_type(data_type: &SqlDataType) -> Result<DataType> {
+    let arrow_type = match data_type {
+        SqlDataType::Boolean | SqlDataType::Bool => DataType::Boolean,
+        SqlDataType::TinyInt(_)
+        | SqlDataType::Int2(_)
+        | SqlDataType::SmallInt(_)
+        | SqlDataType::MediumInt(_)
+        | SqlDataType::Int(_)
+        | SqlDataType::Int4(_)
+        | SqlDataType::Integer(_)
+        | SqlDataType::Int16
+        | SqlDataType::Int32 => DataType::Int32,
+        SqlDataType::BigInt(_)
+        | SqlDataType::Int8(_)
+        | SqlDataType::Int64
+        | SqlDataType::Signed
+        | SqlDataType::SignedInteger => DataType::Int64,
+        SqlDataType::TinyIntUnsigned(_)
+        | SqlDataType::Int2Unsigned(_)
+        | SqlDataType::SmallIntUnsigned(_)
+        | SqlDataType::MediumIntUnsigned(_)
+        | SqlDataType::IntUnsigned(_)
+        | SqlDataType::Int4Unsigned(_)
+        | SqlDataType::IntegerUnsigned(_)
+        | SqlDataType::UTinyInt
+        | SqlDataType::USmallInt
+        | SqlDataType::UInt8
+        | SqlDataType::UInt16
+        | SqlDataType::UInt32 => DataType::UInt32,
+        SqlDataType::BigIntUnsigned(_)
+        | SqlDataType::Int8Unsigned(_)
+        | SqlDataType::UBigInt
+        | SqlDataType::UInt64
+        | SqlDataType::Unsigned
+        | SqlDataType::UnsignedInteger => DataType::UInt64,
+        SqlDataType::Float4 | SqlDataType::Float32 | SqlDataType::Real => DataType::Float32,
+        SqlDataType::Float(_)
+        | SqlDataType::Float8
+        | SqlDataType::Float64
+        | SqlDataType::Double(_)
+        | SqlDataType::DoublePrecision => DataType::Float64,
+        SqlDataType::Character(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::CharacterVarying(_)
+        | SqlDataType::CharVarying(_)
+        | SqlDataType::Varchar(_)
+        | SqlDataType::Nvarchar(_)
+        | SqlDataType::Text
+        | SqlDataType::String(_) => DataType::Utf8,
+        other => {
+            return Err(SparkXError::unsupported(format!(
+                "CAST target type {other}"
+            )));
+        }
+    };
+    Ok(arrow_type)
 }
 
 fn parse_limit(limit: Option<&LimitClause>) -> Result<Option<usize>> {
@@ -542,14 +691,5 @@ fn extract_join_pairs(expr: &SqlExpr, output: &mut Vec<(SqlExpr, SqlExpr)>) -> R
         other => Err(SparkXError::unsupported(format!(
             "join condition {other}; only equality joined with AND is supported"
         ))),
-    }
-}
-
-fn expression_qualifier(expr: &SqlExpr) -> Option<String> {
-    match expr {
-        SqlExpr::CompoundIdentifier(parts) if parts.len() > 1 => {
-            Some(parts[parts.len() - 2].value.clone())
-        }
-        _ => None,
     }
 }

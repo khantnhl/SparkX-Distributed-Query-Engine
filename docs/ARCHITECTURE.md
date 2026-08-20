@@ -92,10 +92,11 @@ Future object-store and Iceberg/Delta adapters implement this trait without chan
 
 ### 3. Logical optimizer
 
-The optimizer recursively normalizes children and applies two rules:
+The optimizer recursively normalizes children and applies three rule families:
 
-1. A `Filter` directly above a `Scan` becomes a scan filter.
-2. A `Projection` directly above a `Scan` computes the union of output and filter columns, then installs a scan projection.
+1. Expressions are simplified with constant folding, Boolean identities, and typed null propagation.
+2. A `Filter` directly above a `Scan` becomes a scan filter.
+3. A `Projection` directly above a `Scan` computes the union of output and filter columns, then installs a scan projection.
 
 Filters are currently executed by SparkX after reading a batch; the pushdown annotation is already positioned for Parquet row-group/page pruning later. The optimizer is deterministic, has no statistics, and preserves a readable before/after plan.
 
@@ -168,9 +169,14 @@ Stage 2 groups partial Arrow rows and merges them. `shuffled_rows` records the s
 
 ### 7. Observability and query result
 
-Each query receives a shared atomic `QueryMetrics` context. Scans and tasks update input rows/batches, estimated bytes, task count, and shuffle rows. The session records output rows/batches and wall-clock nanoseconds. `QueryResult` also preserves all three plan texts and runner/stage metadata.
+Each query receives a shared `QueryMetrics` context. Scans and tasks update input rows/batches,
+estimated bytes, task count, and shuffle rows. The session records output rows/batches and
+wall-clock nanoseconds. `QueryResult` also preserves all three plan texts and runner/stage metadata.
 
-Metrics are deliberately low-level counters. A production version would attach per-operator IDs, histograms, memory reservations, spill bytes, remote fetch time, and OpenTelemetry spans.
+The physical planner assigns deterministic pre-order IDs (`LimitExec#0`, `SortExec#1`, and so on).
+Every operator records emitted rows/batches and elapsed nanoseconds under its ID; repeated
+partition attempts aggregate into the same operator entry. A production version would add input
+and peak-memory counters, histograms, spill bytes, remote fetch time, and OpenTelemetry spans.
 
 ## Core invariants
 
@@ -181,12 +187,20 @@ Metrics are deliberately low-level counters. A production version would attach p
 - Aggregate partials are mergeable using the same logical semantics.
 - An error closes the affected stream and is returned to the session.
 - The runner reports whether distribution actually occurred.
+- Physical operator IDs are deterministic for the same optimized plan.
 
 ## Failure and cancellation model
 
-Today, Arrow/I/O/planning/task errors propagate as `SparkXError`. A dropped result receiver applies natural cancellation pressure because producer sends fail. The error type reserves explicit cancellation, but there is no query-wide cancellation token yet. Worker tasks are not retried, shuffle is not durable, and there is no coordinator recovery.
+Today, Arrow/I/O/planning/task errors propagate as `SparkXError`. A public, cloneable
+`CancellationToken` can be supplied through `execute_sql_with_cancellation` or
+`execute_plan_with_cancellation`; native operators and local distributed tasks observe it and
+return `SparkXError::Cancelled`. Cancellation is cooperative: a blocking storage read already in
+progress cannot be interrupted, but its stream is detached and its eventual output is discarded.
+Worker tasks are not retried, shuffle is not durable, and there is no coordinator recovery.
 
-The production design adds a query-scoped cancellation token, task attempt IDs, idempotent output commits, worker heartbeats, bounded retries, and durable/recomputable shuffle blocks.
+The production design adds deadlines, remote cancellation propagation, task attempt IDs,
+idempotent output commits, worker heartbeats, bounded retries, and durable/recomputable shuffle
+blocks.
 
 ## Deployment shape: now and next
 

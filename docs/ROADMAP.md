@@ -19,6 +19,13 @@ Exit criterion: the repository compiles on a configured Rust host and the checke
 
 ## Phase 1 — correctness and engine contracts
 
+In progress: qualified name scopes and ambiguity errors, primitive `CAST`, SQL three-valued
+Boolean/`NULL` behavior, `IS NULL`, expression normalization/constant folding,
+native/distributed parity coverage, deterministic physical operator IDs with output/timing metrics,
+a cooperative query-wide cancellation token, and the published
+[SQL support matrix](SQL_SUPPORT.md) are now implemented. Richer types, broader SQL coverage,
+SQLLogicTest/differential testing, logical plan IDs, and deeper metrics remain open.
+
 Implement:
 
 - SQL name scopes, ambiguity detection, casts, NULL three-valued logic, and coercion matrix

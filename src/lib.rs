@@ -4,6 +4,7 @@
 //! vectorized operators, scheduler, and metrics) while using Apache Arrow as its
 //! in-memory ABI and Parquet/CSV as storage formats.
 
+pub mod cancellation;
 pub mod catalog;
 pub mod distributed;
 pub mod error;
@@ -15,5 +16,6 @@ pub mod optimizer;
 pub mod planner;
 pub mod session;
 
+pub use cancellation::CancellationToken;
 pub use error::{Result, SparkXError};
 pub use session::{QueryResult, Session, SessionConfig};

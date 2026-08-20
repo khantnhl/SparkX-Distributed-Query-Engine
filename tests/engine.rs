@@ -1,13 +1,15 @@
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use sparkx::catalog::MemoryTable;
+use sparkx::catalog::{MemoryTable, TableProvider};
 use sparkx::expr::{ScalarValue, value_at};
-use sparkx::{Session, SessionConfig, SparkXError};
+use sparkx::{CancellationToken, Session, SessionConfig, SparkXError};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 fn sales_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -62,6 +64,87 @@ fn normalizes_zero_resource_settings() {
     assert_eq!(session.config().batch_size, 1);
     assert_eq!(session.config().channel_capacity, 1);
     assert_eq!(session.config().workers, 1);
+}
+
+#[tokio::test]
+async fn cancellation_stops_native_and_in_flight_distributed_queries() {
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let error = session(false)
+        .execute_sql_with_cancellation("SELECT id FROM sales", cancelled)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SparkXError::Cancelled));
+
+    #[derive(Debug)]
+    struct SlowTable {
+        schema: SchemaRef,
+        batch: RecordBatch,
+        started: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl TableProvider for SlowTable {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+
+        fn partition_count(&self) -> usize {
+            2
+        }
+
+        fn estimated_bytes(&self) -> u64 {
+            self.batch.get_array_memory_size() as u64
+        }
+
+        fn scan_partition(
+            &self,
+            _partition: usize,
+            projection: Option<&[usize]>,
+            _batch_size: usize,
+        ) -> sparkx::Result<Vec<RecordBatch>> {
+            if let Some(started) = self.started.lock().take() {
+                let _ = started.send(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let batch = match projection {
+                Some(indices) => self.batch.project(indices)?,
+                None => self.batch.clone(),
+            };
+            Ok(vec![batch])
+        }
+    }
+
+    let schema = sales_schema();
+    let (started_tx, started_rx) = oneshot::channel();
+    let session = Arc::new(Session::new(SessionConfig {
+        distributed: true,
+        workers: 2,
+        ..SessionConfig::default()
+    }));
+    session.register_table(
+        "slow_sales",
+        Arc::new(SlowTable {
+            schema,
+            batch: sales_batch(0),
+            started: parking_lot::Mutex::new(Some(started_tx)),
+        }),
+    );
+    let cancellation = CancellationToken::new();
+    let query_cancellation = cancellation.clone();
+    let query_session = session.clone();
+    let query = tokio::spawn(async move {
+        query_session
+            .execute_sql_with_cancellation(
+                "SELECT COUNT(*) AS rows FROM slow_sales",
+                query_cancellation,
+            )
+            .await
+    });
+
+    started_rx.await.unwrap();
+    cancellation.cancel();
+    let error = query.await.unwrap().unwrap_err();
+    assert!(matches!(error, SparkXError::Cancelled));
 }
 
 fn grouped_totals(result: &sparkx::QueryResult) -> BTreeMap<String, (u64, f64)> {
@@ -119,6 +202,99 @@ async fn preserves_aliases_and_coerces_mixed_numeric_arithmetic() {
         result.batches[0].schema().field(1).data_type(),
         &DataType::Float64
     );
+}
+
+#[tokio::test]
+async fn executes_explicit_casts_and_preserves_nulls() {
+    let result = session(false)
+        .execute_sql(
+            "SELECT CAST(id AS DOUBLE) AS id_double, \
+                    CAST(amount AS BIGINT) AS amount_integer, \
+                    CAST(id AS VARCHAR) AS id_text, \
+                    CAST(NULL AS BOOLEAN) AS missing \
+             FROM sales ORDER BY id_double LIMIT 1",
+        )
+        .await
+        .unwrap();
+    let batch = &result.batches[0];
+
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Float64);
+    assert_eq!(batch.schema().field(1).data_type(), &DataType::Int64);
+    assert_eq!(batch.schema().field(2).data_type(), &DataType::Utf8);
+    assert_eq!(batch.schema().field(3).data_type(), &DataType::Boolean);
+    assert_eq!(
+        value_at(batch.column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Float64(0.0)
+    );
+    assert_eq!(
+        value_at(batch.column(1).as_ref(), 0).unwrap(),
+        ScalarValue::Int64(10)
+    );
+    assert_eq!(
+        value_at(batch.column(2).as_ref(), 0).unwrap(),
+        ScalarValue::Utf8("0".to_owned())
+    );
+    assert_eq!(
+        value_at(batch.column(3).as_ref(), 0).unwrap(),
+        ScalarValue::Null
+    );
+}
+
+#[tokio::test]
+async fn null_arithmetic_propagates_and_invalid_implicit_coercions_are_rejected() {
+    let result = session(false)
+        .execute_sql("SELECT id + NULL AS missing FROM sales LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.batches[0].schema().field(0).data_type(),
+        &DataType::Int64
+    );
+    assert_eq!(
+        value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Null
+    );
+
+    let error = session(false)
+        .sql("SELECT amount + region FROM sales")
+        .unwrap_err();
+    assert!(
+        matches!(error, SparkXError::Planning(message) if message.contains("requires numeric operands"))
+    );
+
+    let error = session(false)
+        .sql("SELECT CAST(id AS DATE) FROM sales")
+        .unwrap_err();
+    assert!(matches!(error, SparkXError::Unsupported(message) if message.contains("DATE")));
+}
+
+#[tokio::test]
+async fn optimizer_folds_constants_simplifies_booleans_and_propagates_nulls() {
+    let result = session(false)
+        .execute_sql(
+            "SELECT 1 + 2 AS three, amount + NULL AS missing \
+             FROM sales WHERE TRUE AND amount > (5 + 5) LIMIT 1",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Int64(3)
+    );
+    assert_eq!(
+        value_at(result.batches[0].column(1).as_ref(), 0).unwrap(),
+        ScalarValue::Null
+    );
+    assert!(result.optimized_plan.contains("3 AS three"));
+    assert!(
+        result
+            .optimized_plan
+            .contains("CAST(NULL AS Float64) AS missing")
+    );
+    assert!(result.optimized_plan.contains("filters=[(#amount > 10)]"));
+    assert!(!result.optimized_plan.contains("(5 + 5)"));
+    assert!(!result.optimized_plan.contains("true AND"));
 }
 
 #[tokio::test]
@@ -193,6 +369,57 @@ async fn local_cluster_matches_native_aggregate() {
     assert!(cluster.distributed);
     assert_eq!(cluster.stages, 2);
     assert!(cluster.metrics.shuffled_rows > 0);
+    assert_eq!(cluster.metrics.operators.len(), 2);
+    assert_eq!(cluster.metrics.operators[0].operator_id, 0);
+    assert_eq!(cluster.metrics.operators[0].name, "HashAggregate");
+    assert_eq!(cluster.metrics.operators[0].output_rows, 2);
+    assert_eq!(cluster.metrics.operators[1].operator_id, 1);
+    assert_eq!(cluster.metrics.operators[1].name, "Scan");
+}
+
+#[tokio::test]
+async fn local_cluster_matches_native_null_filter_semantics() {
+    fn nullable_session(distributed: bool) -> Session {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            true,
+        )]));
+        let partitions = vec![
+            vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(BooleanArray::from(vec![Some(true), Some(false)]))],
+                )
+                .unwrap(),
+            ],
+            vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(BooleanArray::from(vec![None, Some(true)]))],
+                )
+                .unwrap(),
+            ],
+        ];
+        let session = Session::new(SessionConfig {
+            distributed,
+            workers: 2,
+            ..SessionConfig::default()
+        });
+        session.register_memory("flags", MemoryTable::new(schema, partitions).unwrap());
+        session
+    }
+
+    let sql = "SELECT COUNT(*) AS rows FROM flags WHERE flag OR NULL";
+    let native = nullable_session(false).execute_sql(sql).await.unwrap();
+    let cluster = nullable_session(true).execute_sql(sql).await.unwrap();
+    let native_count = value_at(native.batches[0].column(0).as_ref(), 0).unwrap();
+    let cluster_count = value_at(cluster.batches[0].column(0).as_ref(), 0).unwrap();
+
+    assert_eq!(native_count, ScalarValue::UInt64(2));
+    assert_eq!(cluster_count, native_count);
+    assert!(cluster.distributed);
+    assert_eq!(cluster.stages, 2);
 }
 
 #[tokio::test]
@@ -238,6 +465,71 @@ async fn executes_inner_hash_join() {
 }
 
 #[tokio::test]
+async fn detects_ambiguous_join_columns_and_resolves_qualified_columns() {
+    let session = session(false);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("customer_id", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    session.register_memory(
+        "customers",
+        MemoryTable::new(schema, vec![vec![batch]]).unwrap(),
+    );
+
+    let error = session
+        .sql("SELECT id FROM sales JOIN customers ON sales.customer_id = customers.customer_id")
+        .unwrap_err();
+    assert!(matches!(error, SparkXError::Planning(message) if message.contains("ambiguous")));
+
+    let error = session
+        .sql("SELECT sales.id FROM sales JOIN customers ON customer_id = customer_id")
+        .unwrap_err();
+    assert!(matches!(error, SparkXError::Planning(message) if message.contains("ambiguous")));
+
+    let result = session
+        .execute_sql(
+            "SELECT sales.id AS sale_id, customers.id AS customer_row_id \
+             FROM sales JOIN customers \
+             ON sales.customer_id = customers.customer_id \
+             ORDER BY sale_id LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Int64(0)
+    );
+    assert_eq!(
+        value_at(result.batches[0].column(1).as_ref(), 0).unwrap(),
+        ScalarValue::Int64(100)
+    );
+}
+
+#[tokio::test]
+async fn table_aliases_define_the_visible_qualifier() {
+    let session = session(false);
+    let result = session
+        .execute_sql("SELECT s.id FROM sales AS s ORDER BY s.id LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Int64(0)
+    );
+
+    let error = session.sql("SELECT sales.id FROM sales AS s").unwrap_err();
+    assert!(matches!(error, SparkXError::Planning(message) if message.contains("does not exist")));
+}
+
+#[tokio::test]
 async fn executes_left_hash_join_with_null_extension() {
     let session = session(false);
     let schema = Arc::new(Schema::new(vec![
@@ -269,6 +561,108 @@ async fn executes_left_hash_join_with_null_extension() {
 }
 
 #[tokio::test]
+async fn implements_sql_three_valued_boolean_logic() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "flag",
+        DataType::Boolean,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )
+    .unwrap();
+    let session = Session::new(SessionConfig::default());
+    session.register_memory(
+        "flags",
+        MemoryTable::new(schema, vec![vec![batch]]).unwrap(),
+    );
+
+    let result = session
+        .execute_sql(
+            "SELECT flag, flag AND NULL AS and_unknown, flag OR NULL AS or_unknown, \
+             flag IS NULL AS missing, flag IS NOT NULL AS present FROM flags",
+        )
+        .await
+        .unwrap();
+    let batch = &result.batches[0];
+    let expected = [
+        [
+            ScalarValue::Boolean(true),
+            ScalarValue::Null,
+            ScalarValue::Boolean(true),
+            ScalarValue::Boolean(false),
+            ScalarValue::Boolean(true),
+        ],
+        [
+            ScalarValue::Boolean(false),
+            ScalarValue::Boolean(false),
+            ScalarValue::Null,
+            ScalarValue::Boolean(false),
+            ScalarValue::Boolean(true),
+        ],
+        [
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Null,
+            ScalarValue::Boolean(true),
+            ScalarValue::Boolean(false),
+        ],
+    ];
+    for (row, expected_row) in expected.iter().enumerate() {
+        for (column, expected_value) in expected_row.iter().enumerate() {
+            assert_eq!(
+                value_at(batch.column(column).as_ref(), row).unwrap(),
+                *expected_value
+            );
+        }
+    }
+
+    let filtered = session
+        .execute_sql("SELECT flag FROM flags WHERE flag OR NULL")
+        .await
+        .unwrap();
+    assert_eq!(filtered.row_count(), 1);
+    assert_eq!(
+        value_at(filtered.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Boolean(true)
+    );
+
+    let missing = session
+        .execute_sql("SELECT flag FROM flags WHERE flag IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(missing.row_count(), 1);
+    assert_eq!(
+        value_at(missing.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Null
+    );
+}
+
+#[tokio::test]
+async fn null_comparisons_produce_unknown() {
+    let session = session(false);
+    let result = session
+        .execute_sql("SELECT id = NULL AS comparison FROM sales LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::Null
+    );
+
+    let filtered = session
+        .execute_sql("SELECT id FROM sales WHERE id = NULL")
+        .await
+        .unwrap();
+    assert_eq!(filtered.row_count(), 0);
+}
+
+#[tokio::test]
 async fn reads_csv_and_pushes_scan_projection() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sales.csv");
@@ -282,6 +676,33 @@ async fn reads_csv_and_pushes_scan_projection() {
     assert_eq!(result.row_count(), 1);
     assert!(result.optimized_plan.contains("projection="));
     assert!(result.optimized_plan.contains("filters="));
+}
+
+#[tokio::test]
+async fn single_partition_csv_safely_falls_back_to_native() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sales.csv");
+    std::fs::write(&path, "id,region,amount\n1,east,12.5\n2,west,7.5\n").unwrap();
+    let session = Session::new(SessionConfig {
+        distributed: true,
+        workers: 2,
+        ..SessionConfig::default()
+    });
+    session.register_csv("sales", &path).unwrap();
+
+    let result = session
+        .execute_sql("SELECT COUNT(*) AS rows FROM sales")
+        .await
+        .unwrap();
+
+    assert!(!result.distributed);
+    assert_eq!(result.stages, 1);
+    assert_eq!(result.metrics.tasks, 1);
+    assert_eq!(result.metrics.shuffled_rows, 0);
+    assert_eq!(
+        value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::UInt64(2)
+    );
 }
 
 #[tokio::test]
@@ -310,6 +731,10 @@ async fn reads_parquet_row_groups_as_partitions() {
         value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
         ScalarValue::UInt64(4)
     );
+    assert!(result.distributed);
+    assert_eq!(result.stages, 2);
+    assert_eq!(result.metrics.tasks, 2);
+    assert_eq!(result.metrics.shuffled_rows, 2);
 }
 
 #[test]
@@ -323,6 +748,38 @@ fn explains_all_three_plan_layers() {
     assert!(explanation.contains("== Optimized Logical Plan =="));
     assert!(explanation.contains("== Physical Plan =="));
     assert!(explanation.contains("HashAggregate"));
+}
+
+#[tokio::test]
+async fn physical_operator_ids_and_metrics_are_stable() {
+    let sql = "SELECT id, amount FROM sales WHERE amount >= 22 ORDER BY id LIMIT 2";
+    let first = session(false).execute_sql(sql).await.unwrap();
+    let second = session(false).execute_sql(sql).await.unwrap();
+
+    assert_eq!(first.physical_plan, second.physical_plan);
+    assert!(first.physical_plan.contains("LimitExec#0"));
+    assert!(first.physical_plan.contains("SortExec#1"));
+    assert!(first.physical_plan.contains("ProjectionExec#2"));
+    assert!(first.physical_plan.contains("ScanExec#3"));
+
+    let operators = first
+        .metrics
+        .operators
+        .iter()
+        .map(|operator| (operator.operator_id, operator.name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operators,
+        vec![(0, "Limit"), (1, "Sort"), (2, "Projection"), (3, "Scan")]
+    );
+    assert!(
+        first
+            .metrics
+            .operators
+            .iter()
+            .all(|operator| operator.output_batches > 0)
+    );
+    assert_eq!(first.metrics.operators[0].output_rows, 2);
 }
 
 #[test]

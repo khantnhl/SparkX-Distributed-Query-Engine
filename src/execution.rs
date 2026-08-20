@@ -1,3 +1,4 @@
+use crate::cancellation::CancellationToken;
 use crate::catalog::TableRef;
 use crate::error::{Result, SparkXError};
 use crate::expr::{AggregateFunction, Expr, ScalarValue, evaluate, scalars_to_array, value_at};
@@ -12,11 +13,15 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+pub type OperatorId = u32;
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
     Scan {
+        id: OperatorId,
         table_name: String,
         provider: TableRef,
         projection: Option<Vec<usize>>,
@@ -24,32 +29,38 @@ pub enum PhysicalPlan {
         schema: SchemaRef,
     },
     Projection {
+        id: OperatorId,
         input: Arc<PhysicalPlan>,
         exprs: Vec<Expr>,
         schema: SchemaRef,
     },
     Filter {
+        id: OperatorId,
         input: Arc<PhysicalPlan>,
         predicate: Expr,
         schema: SchemaRef,
     },
     HashAggregate {
+        id: OperatorId,
         input: Arc<PhysicalPlan>,
         group_exprs: Vec<Expr>,
         aggregate_exprs: Vec<Expr>,
         schema: SchemaRef,
     },
     Sort {
+        id: OperatorId,
         input: Arc<PhysicalPlan>,
         exprs: Vec<SortExpr>,
         schema: SchemaRef,
     },
     Limit {
+        id: OperatorId,
         input: Arc<PhysicalPlan>,
         limit: usize,
         schema: SchemaRef,
     },
     HashJoin {
+        id: OperatorId,
         left: Arc<PhysicalPlan>,
         right: Arc<PhysicalPlan>,
         join_type: JoinType,
@@ -60,6 +71,30 @@ pub enum PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    pub fn id(&self) -> OperatorId {
+        match self {
+            Self::Scan { id, .. }
+            | Self::Projection { id, .. }
+            | Self::Filter { id, .. }
+            | Self::HashAggregate { id, .. }
+            | Self::Sort { id, .. }
+            | Self::Limit { id, .. }
+            | Self::HashJoin { id, .. } => *id,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Scan { .. } => "Scan",
+            Self::Projection { .. } => "Projection",
+            Self::Filter { .. } => "Filter",
+            Self::HashAggregate { .. } => "HashAggregate",
+            Self::Sort { .. } => "Sort",
+            Self::Limit { .. } => "Limit",
+            Self::HashJoin { .. } => "HashJoin",
+        }
+    }
+
     pub fn schema(&self) -> SchemaRef {
         match self {
             Self::Scan { schema, .. }
@@ -82,6 +117,7 @@ impl PhysicalPlan {
         output.push_str(&"  ".repeat(indent));
         match self {
             Self::Scan {
+                id,
                 table_name,
                 projection,
                 filters,
@@ -89,7 +125,7 @@ impl PhysicalPlan {
                 ..
             } => {
                 output.push_str(&format!(
-                    "Parquet/Csv/MemoryScanExec: {table_name} partitions={} projection={projection:?}",
+                    "Parquet/Csv/MemoryScanExec#{id}: {table_name} partitions={} projection={projection:?}",
                     provider.partition_count()
                 ));
                 if !filters.is_empty() {
@@ -104,32 +140,43 @@ impl PhysicalPlan {
                 }
                 output.push('\n');
             }
-            Self::Projection { input, exprs, .. } => {
-                output.push_str(&format!("ProjectionExec: [{}]\n", display_exprs(exprs)));
+            Self::Projection {
+                id, input, exprs, ..
+            } => {
+                output.push_str(&format!(
+                    "ProjectionExec#{id}: [{}]\n",
+                    display_exprs(exprs)
+                ));
                 input.format_into(indent + 1, output);
             }
             Self::Filter {
-                input, predicate, ..
+                id,
+                input,
+                predicate,
+                ..
             } => {
-                output.push_str(&format!("FilterExec: {predicate}\n"));
+                output.push_str(&format!("FilterExec#{id}: {predicate}\n"));
                 input.format_into(indent + 1, output);
             }
             Self::HashAggregate {
+                id,
                 input,
                 group_exprs,
                 aggregate_exprs,
                 ..
             } => {
                 output.push_str(&format!(
-                    "HashAggregateExec: group=[{}] aggr=[{}]\n",
+                    "HashAggregateExec#{id}: group=[{}] aggr=[{}]\n",
                     display_exprs(group_exprs),
                     display_exprs(aggregate_exprs)
                 ));
                 input.format_into(indent + 1, output);
             }
-            Self::Sort { input, exprs, .. } => {
+            Self::Sort {
+                id, input, exprs, ..
+            } => {
                 output.push_str(&format!(
-                    "SortExec: [{}]\n",
+                    "SortExec#{id}: [{}]\n",
                     exprs
                         .iter()
                         .map(|sort| format!(
@@ -142,11 +189,14 @@ impl PhysicalPlan {
                 ));
                 input.format_into(indent + 1, output);
             }
-            Self::Limit { input, limit, .. } => {
-                output.push_str(&format!("LimitExec: {limit}\n"));
+            Self::Limit {
+                id, input, limit, ..
+            } => {
+                output.push_str(&format!("LimitExec#{id}: {limit}\n"));
                 input.format_into(indent + 1, output);
             }
             Self::HashJoin {
+                id,
                 left,
                 right,
                 join_type,
@@ -155,7 +205,7 @@ impl PhysicalPlan {
                 ..
             } => {
                 output.push_str(&format!(
-                    "HashJoinExec: {join_type} [{} = {}]\n",
+                    "HashJoinExec#{id}: {join_type} [{} = {}]\n",
                     display_exprs(left_on),
                     display_exprs(right_on)
                 ));
@@ -180,6 +230,7 @@ pub struct TaskContext {
     pub channel_capacity: usize,
     pub partition: Option<usize>,
     pub metrics: MetricsRef,
+    pub cancellation: CancellationToken,
 }
 
 pub struct BatchReceiver {
@@ -201,7 +252,15 @@ impl BatchReceiver {
 }
 
 pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
-    match plan.as_ref() {
+    if let Err(error) = context.cancellation.check() {
+        return error_receiver(error, context.channel_capacity);
+    }
+    let operator_id = plan.id();
+    let operator_name = plan.name();
+    let metrics = context.metrics.clone();
+    let cancellation = context.cancellation.clone();
+    let channel_capacity = context.channel_capacity;
+    let output = match plan.as_ref() {
         PhysicalPlan::Scan {
             provider,
             projection,
@@ -217,6 +276,7 @@ pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
             input,
             exprs,
             schema,
+            ..
         } => {
             let child = execute(input.clone(), context.clone());
             execute_projection(child, exprs.clone(), schema.clone(), context)
@@ -232,6 +292,7 @@ pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
             group_exprs,
             aggregate_exprs,
             schema,
+            ..
         } => {
             let child = execute(input.clone(), context.clone());
             execute_aggregate(
@@ -246,6 +307,7 @@ pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
             input,
             exprs,
             schema,
+            ..
         } => {
             let child = execute(input.clone(), context.clone());
             execute_sort(child, exprs.clone(), schema.clone(), context)
@@ -261,6 +323,7 @@ pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
             left_on,
             right_on,
             schema,
+            ..
         } => {
             let left = execute(left.clone(), context.clone());
             let right = execute(right.clone(), context.clone());
@@ -274,7 +337,59 @@ pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
                 context,
             )
         }
-    }
+    };
+    track_operator_output(
+        output,
+        operator_id,
+        operator_name,
+        channel_capacity,
+        metrics,
+        cancellation,
+    )
+}
+
+fn error_receiver(error: SparkXError, channel_capacity: usize) -> BatchReceiver {
+    let (sender, receiver) = mpsc::channel(channel_capacity);
+    let _ = sender.try_send(Err(error));
+    BatchReceiver { receiver }
+}
+
+fn track_operator_output(
+    mut input: BatchReceiver,
+    operator_id: OperatorId,
+    operator_name: &'static str,
+    channel_capacity: usize,
+    metrics: MetricsRef,
+    cancellation: CancellationToken,
+) -> BatchReceiver {
+    let (sender, receiver) = mpsc::channel(channel_capacity);
+    tokio::spawn(async move {
+        let started = Instant::now();
+        loop {
+            if cancellation.is_cancelled() {
+                let _ = sender.send(Err(SparkXError::Cancelled)).await;
+                break;
+            }
+            let result = tokio::select! {
+                result = input.recv() => result,
+                _ = cancellation.cancelled() => {
+                    let _ = sender.send(Err(SparkXError::Cancelled)).await;
+                    break;
+                }
+            };
+            let Some(result) = result else {
+                break;
+            };
+            if let Ok(batch) = &result {
+                metrics.record_operator_output(operator_id, operator_name, batch.num_rows());
+            }
+            if sender.send(result).await.is_err() {
+                break;
+            }
+        }
+        metrics.add_operator_elapsed(operator_id, operator_name, started.elapsed());
+    });
+    BatchReceiver { receiver }
 }
 
 fn execute_scan(

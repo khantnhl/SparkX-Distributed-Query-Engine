@@ -6,7 +6,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -140,7 +140,7 @@ pub enum AggregateFunction {
 
 impl Display for AggregateFunction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self).map(|_| ())
+        write!(f, "{self:?}")
     }
 }
 
@@ -152,6 +152,14 @@ pub enum Expr {
         left: Box<Expr>,
         op: Operator,
         right: Box<Expr>,
+    },
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+    Cast {
+        expr: Box<Expr>,
+        data_type: DataType,
     },
     Alias(Box<Expr>, String),
     Aggregate {
@@ -183,11 +191,25 @@ impl Expr {
         Self::Alias(Box::new(self), alias.into())
     }
 
+    pub fn is_null(expr: Expr, negated: bool) -> Self {
+        Self::IsNull {
+            expr: Box::new(expr),
+            negated,
+        }
+    }
+
+    pub fn cast(expr: Expr, data_type: DataType) -> Self {
+        Self::Cast {
+            expr: Box::new(expr),
+            data_type,
+        }
+    }
+
     pub fn name(&self) -> String {
         match self {
             Self::Column(name) => unqualified(name).to_owned(),
             Self::Literal(value) => value.to_string(),
-            Self::Binary { .. } => self.to_string(),
+            Self::Binary { .. } | Self::IsNull { .. } | Self::Cast { .. } => self.to_string(),
             Self::Alias(_, alias) => alias.clone(),
             Self::Aggregate { function, expr, .. } => {
                 format!("{}({})", function.to_string().to_uppercase(), expr)
@@ -218,7 +240,10 @@ impl Expr {
                 left.collect_columns(columns);
                 right.collect_columns(columns);
             }
-            Self::Alias(expr, _) | Self::Aggregate { expr, .. } => expr.collect_columns(columns),
+            Self::IsNull { expr, .. }
+            | Self::Cast { expr, .. }
+            | Self::Alias(expr, _)
+            | Self::Aggregate { expr, .. } => expr.collect_columns(columns),
             Self::Literal(_) | Self::Wildcard => {}
         }
     }
@@ -229,9 +254,38 @@ impl Expr {
             Self::Binary { left, right, .. } => {
                 left.contains_aggregate() || right.contains_aggregate()
             }
-            Self::Alias(expr, _) => expr.contains_aggregate(),
+            Self::IsNull { expr, .. } | Self::Cast { expr, .. } | Self::Alias(expr, _) => {
+                expr.contains_aggregate()
+            }
             _ => false,
         }
+    }
+
+    pub fn simplify(&self, schema: &Schema) -> Result<Expr> {
+        let simplified = match self {
+            Self::Binary { left, op, right } => {
+                Self::binary(left.simplify(schema)?, *op, right.simplify(schema)?)
+            }
+            Self::IsNull { expr, negated } => Self::is_null(expr.simplify(schema)?, *negated),
+            Self::Cast { expr, data_type } => Self::cast(expr.simplify(schema)?, data_type.clone()),
+            Self::Alias(expr, alias) => {
+                return Ok(expr.simplify(schema)?.alias(alias.clone()));
+            }
+            Self::Aggregate {
+                function,
+                expr,
+                distinct,
+            } => {
+                return Ok(Self::Aggregate {
+                    function: *function,
+                    expr: Box::new(expr.simplify(schema)?),
+                    distinct: *distinct,
+                });
+            }
+            Self::Wildcard => return Ok(Self::Wildcard),
+            Self::Column(_) | Self::Literal(_) => self.clone(),
+        };
+        simplify_node(simplified, schema)
     }
 
     pub fn data_type(&self, schema: &Schema) -> Result<DataType> {
@@ -243,7 +297,7 @@ impl Expr {
                 let right_type = right.data_type(schema)?;
                 match op {
                     Operator::And | Operator::Or
-                        if left_type == DataType::Boolean && right_type == DataType::Boolean =>
+                        if is_boolean_or_null(&left_type) && is_boolean_or_null(&right_type) =>
                     {
                         Ok(DataType::Boolean)
                     }
@@ -257,6 +311,8 @@ impl Expr {
                     | Operator::Gt
                     | Operator::GtEq
                         if left_type == right_type
+                            || left_type == DataType::Null
+                            || right_type == DataType::Null
                             || common_numeric_type(&left_type, &right_type).is_some() =>
                     {
                         Ok(DataType::Boolean)
@@ -269,18 +325,17 @@ impl Expr {
                     | Operator::GtEq => Err(SparkXError::planning(format!(
                         "cannot compare {left_type} and {right_type}"
                     ))),
-                    Operator::Add
-                    | Operator::Subtract
-                    | Operator::Multiply
-                    | Operator::Divide => common_numeric_type(&left_type, &right_type).ok_or_else(
-                        || {
+                    Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
+                        common_numeric_type(&left_type, &right_type).ok_or_else(|| {
                             SparkXError::planning(format!(
                                 "{op} requires numeric operands, got {left_type} and {right_type}"
                             ))
-                        },
-                    ),
+                        })
+                    }
                 }
             }
+            Self::IsNull { .. } => Ok(DataType::Boolean),
+            Self::Cast { data_type, .. } => Ok(data_type.clone()),
             Self::Aggregate { function, expr, .. } => match function {
                 AggregateFunction::Count => Ok(DataType::UInt64),
                 AggregateFunction::Sum | AggregateFunction::Avg => {
@@ -313,6 +368,10 @@ impl Display for Expr {
             Self::Column(name) => write!(f, "#{name}"),
             Self::Literal(value) => write!(f, "{value}"),
             Self::Binary { left, op, right } => write!(f, "({left} {op} {right})"),
+            Self::IsNull { expr, negated } => {
+                write!(f, "({expr} IS {}NULL)", if *negated { "NOT " } else { "" })
+            }
+            Self::Cast { expr, data_type } => write!(f, "CAST({expr} AS {data_type})"),
             Self::Alias(expr, alias) => write!(f, "{expr} AS {alias}"),
             Self::Aggregate {
                 function,
@@ -334,22 +393,135 @@ pub fn unqualified(name: &str) -> &str {
 }
 
 pub fn find_field<'a>(schema: &'a Schema, name: &str) -> Result<&'a Field> {
-    let short = unqualified(name);
-    schema
-        .fields()
-        .iter()
-        .find(|field| field.name() == name || field.name() == short)
-        .map(|field| field.as_ref())
-        .ok_or_else(|| SparkXError::planning(format!("column '{name}' does not exist")))
+    Ok(schema.field(resolve_field_index(schema, name)?))
 }
 
 pub fn find_column(schema: &Schema, name: &str) -> Result<usize> {
-    let short = unqualified(name);
-    schema
+    resolve_field_index(schema, name)
+}
+
+fn resolve_field_index(schema: &Schema, name: &str) -> Result<usize> {
+    let exact = schema
         .fields()
         .iter()
-        .position(|field| field.name() == name || field.name() == short)
-        .ok_or_else(|| SparkXError::planning(format!("column '{name}' does not exist")))
+        .enumerate()
+        .filter_map(|(index, field)| (field.name() == name).then_some(index))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [index] => return Ok(*index),
+        [_, _, ..] => return Err(ambiguous_column(name)),
+        [] => {}
+    }
+
+    let qualified = name.contains('.');
+    let schema_is_qualified = schema
+        .fields()
+        .iter()
+        .any(|field| field.name().contains('.'));
+    if qualified && schema_is_qualified {
+        return Err(SparkXError::planning(format!(
+            "column '{name}' does not exist"
+        )));
+    }
+
+    let short = unqualified(name);
+    let matches = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (unqualified(field.name()) == short).then_some(index))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [_, _, ..] => Err(ambiguous_column(name)),
+        [] => Err(SparkXError::planning(format!(
+            "column '{name}' does not exist"
+        ))),
+    }
+}
+
+fn ambiguous_column(name: &str) -> SparkXError {
+    SparkXError::planning(format!(
+        "column '{name}' is ambiguous; qualify it with a table name or alias"
+    ))
+}
+
+fn simplify_node(expr: Expr, schema: &Schema) -> Result<Expr> {
+    let output_type = expr.data_type(schema)?;
+    if expr.columns().is_empty() && !expr.contains_aggregate() {
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )?;
+        let value = evaluate(&expr, &batch)?;
+        return Ok(typed_literal(
+            value_at(value.as_ref(), 0)?,
+            value.data_type(),
+        ));
+    }
+
+    let Expr::Binary { left, op, right } = &expr else {
+        return Ok(expr);
+    };
+    if matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+    ) && (is_null_expression(left) || is_null_expression(right))
+    {
+        return Ok(typed_literal(ScalarValue::Null, &output_type));
+    }
+
+    match (op, boolean_literal(left), boolean_literal(right)) {
+        (Operator::And, Some(true), _) | (Operator::Or, Some(false), _) => {
+            Ok(right.as_ref().clone())
+        }
+        (Operator::And, _, Some(true)) | (Operator::Or, _, Some(false)) => {
+            Ok(left.as_ref().clone())
+        }
+        (Operator::And, Some(false), _)
+        | (Operator::And, _, Some(false))
+        | (Operator::Or, Some(true), _)
+        | (Operator::Or, _, Some(true)) => Ok(Expr::literal(ScalarValue::Boolean(matches!(
+            op,
+            Operator::Or
+        )))),
+        _ => Ok(expr),
+    }
+}
+
+fn typed_literal(value: ScalarValue, data_type: &DataType) -> Expr {
+    let value_type = value.data_type();
+    let literal = Expr::literal(value);
+    if &value_type == data_type {
+        literal
+    } else {
+        Expr::cast(literal, data_type.clone())
+    }
+}
+
+fn is_null_expression(expr: &Expr) -> bool {
+    match expr.unalias() {
+        Expr::Literal(ScalarValue::Null) => true,
+        Expr::Cast { expr, .. } => is_null_expression(expr),
+        _ => false,
+    }
+}
+
+fn boolean_literal(expr: &Expr) -> Option<bool> {
+    match expr.unalias() {
+        Expr::Literal(ScalarValue::Boolean(value)) => Some(*value),
+        _ => None,
+    }
 }
 
 pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
@@ -361,15 +533,45 @@ pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
         Expr::Binary { left, op, right } => {
             let mut left = evaluate(left, batch)?;
             let mut right = evaluate(right, batch)?;
-            if left.data_type() != right.data_type() {
-                let target =
-                    common_numeric_type(left.data_type(), right.data_type()).ok_or_else(|| {
-                        SparkXError::execution(format!(
-                            "cannot apply {op} to {} and {}",
-                            left.data_type(),
-                            right.data_type()
+            if left.data_type() == &DataType::Null && right.data_type() == &DataType::Null {
+                return match op {
+                    Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::And
+                    | Operator::Or => {
+                        Ok(Arc::new(BooleanArray::from(vec![None; batch.num_rows()])))
+                    }
+                    Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
+                        Err(SparkXError::execution(
+                            "cannot infer the type of arithmetic on NULL values",
                         ))
-                    })?;
+                    }
+                };
+            }
+            if left.data_type() != right.data_type() {
+                let target = if matches!(
+                    op,
+                    Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide
+                ) {
+                    common_numeric_type(left.data_type(), right.data_type())
+                } else {
+                    match (left.data_type(), right.data_type()) {
+                        (DataType::Null, right_type) => Some(right_type.clone()),
+                        (left_type, DataType::Null) => Some(left_type.clone()),
+                        (left_type, right_type) => common_numeric_type(left_type, right_type),
+                    }
+                }
+                .ok_or_else(|| {
+                    SparkXError::execution(format!(
+                        "cannot apply {op} to {} and {}",
+                        left.data_type(),
+                        right.data_type()
+                    ))
+                })?;
                 left = cast(&left, &target)?;
                 right = cast(&right, &target)?;
             }
@@ -380,14 +582,29 @@ pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
                 Operator::LtEq => Arc::new(cmp::lt_eq(&left.as_ref(), &right.as_ref())?),
                 Operator::Gt => Arc::new(cmp::gt(&left.as_ref(), &right.as_ref())?),
                 Operator::GtEq => Arc::new(cmp::gt_eq(&left.as_ref(), &right.as_ref())?),
-                Operator::And => Arc::new(boolean::and(as_boolean(&left)?, as_boolean(&right)?)?),
-                Operator::Or => Arc::new(boolean::or(as_boolean(&left)?, as_boolean(&right)?)?),
+                Operator::And => Arc::new(boolean::and_kleene(
+                    as_boolean(&left)?,
+                    as_boolean(&right)?,
+                )?),
+                Operator::Or => {
+                    Arc::new(boolean::or_kleene(as_boolean(&left)?, as_boolean(&right)?)?)
+                }
                 Operator::Add => numeric::add(&left.as_ref(), &right.as_ref())?,
                 Operator::Subtract => numeric::sub(&left.as_ref(), &right.as_ref())?,
                 Operator::Multiply => numeric::mul(&left.as_ref(), &right.as_ref())?,
                 Operator::Divide => numeric::div(&left.as_ref(), &right.as_ref())?,
             };
             Ok(result)
+        }
+        Expr::Cast { expr, data_type } => Ok(cast(&evaluate(expr, batch)?, data_type)?),
+        Expr::IsNull { expr, negated } => {
+            let value = evaluate(expr, batch)?;
+            let result = if *negated {
+                boolean::is_not_null(value.as_ref())?
+            } else {
+                boolean::is_null(value.as_ref())?
+            };
+            Ok(Arc::new(result))
         }
         Expr::Aggregate { .. } => Err(SparkXError::execution(
             "aggregate expression cannot be evaluated row-wise",
@@ -401,10 +618,28 @@ pub fn evaluate(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
 
 fn common_numeric_type(left: &DataType, right: &DataType) -> Option<DataType> {
     use DataType::*;
+    if left == &Null && is_numeric(right) {
+        return normalized_numeric_type(right);
+    }
+    if right == &Null && is_numeric(left) {
+        return normalized_numeric_type(left);
+    }
+    if !is_numeric(left) || !is_numeric(right) {
+        return None;
+    }
     match (left, right) {
         (Float64, _) | (_, Float64) | (Float32, _) | (_, Float32) => Some(Float64),
         (Int64 | Int32, Int64 | Int32) => Some(Int64),
         (UInt64 | UInt32, UInt64 | UInt32) => Some(UInt64),
+        _ => None,
+    }
+}
+
+fn normalized_numeric_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Int32 | DataType::Int64 => Some(DataType::Int64),
+        DataType::UInt32 | DataType::UInt64 => Some(DataType::UInt64),
+        DataType::Float32 | DataType::Float64 => Some(DataType::Float64),
         _ => None,
     }
 }
@@ -419,6 +654,10 @@ fn is_numeric(data_type: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
     )
+}
+
+fn is_boolean_or_null(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Boolean | DataType::Null)
 }
 
 fn as_boolean(array: &ArrayRef) -> Result<&BooleanArray> {
@@ -445,6 +684,7 @@ pub fn value_at(array: &dyn Array, row: usize) -> Result<ScalarValue> {
         return Ok(ScalarValue::Null);
     }
     let value = match array.data_type() {
+        DataType::Null => ScalarValue::Null,
         DataType::Boolean => ScalarValue::Boolean(
             array
                 .as_any()
