@@ -177,6 +177,12 @@ Stage 1 executes one task per source partition, limited by the configured worker
 
 Stage 2 groups partial Arrow rows and merges them. `shuffled_rows` records the size of this exchange. Unsupported distributed shapes—including distinct aggregates, which need a set-aware exchange—intentionally fall back to native execution and report `distributed = false`; they do not silently pretend to be distributed.
 
+The transport-neutral contracts in `protocol.rs` define versioned coordinator assignments and
+worker registration, heartbeat, task-state, lease, cancellation, and immutable shuffle-block
+messages. IDs and cross-message ownership are validated before use, and the contracts round-trip
+through Serde. `StagePlan.plan_fragment` is deliberately opaque until a physical-plan codec lands.
+These types are not wired into `LocalCluster` and do not imply that an RPC service exists.
+
 ### 7. Observability and query result
 
 Each query receives a shared `QueryMetrics` context. Scans and tasks update input rows/batches,
@@ -209,9 +215,9 @@ return `SparkXError::Cancelled`. Cancellation is cooperative: a blocking storage
 progress cannot be interrupted, but its stream is detached and its eventual output is discarded.
 Worker tasks are not retried, shuffle is not durable, and there is no coordinator recovery.
 
-The production design adds deadlines, remote cancellation propagation, task attempt IDs,
-idempotent output commits, worker heartbeats, bounded retries, and durable/recomputable shuffle
-blocks.
+The protocol contracts now represent task attempts, leases, cancellation, heartbeats, and
+recomputable shuffle-block metadata. The production runtime still needs deadlines, remote
+propagation, idempotent output commits, bounded retries, durable storage, and coordinator recovery.
 
 ## Deployment shape: now and next
 

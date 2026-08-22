@@ -15,6 +15,7 @@ pub mod memory;
 pub mod metrics;
 pub mod optimizer;
 pub mod planner;
+pub mod protocol;
 mod pruning;
 pub mod session;
 

@@ -25,6 +25,9 @@ pub enum SparkXError {
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
     #[error("resource not found: {0}")]
     NotFound(String),
 
@@ -49,6 +52,10 @@ impl SparkXError {
 
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::Unsupported(message.into())
+    }
+
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol(message.into())
     }
 
     pub fn resource_exhausted(message: impl Into<String>) -> Self {

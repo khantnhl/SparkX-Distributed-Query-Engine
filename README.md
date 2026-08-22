@@ -20,6 +20,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Bounded Tokio channels for backpressure between streaming operators
 - Concurrent partition scans and a worker-limited local cluster
 - Two-stage partial/final distributed aggregation with an Arrow exchange boundary
+- Versioned, serializable coordinator/worker protocol contracts
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing/pruning metrics, and cooperative query cancellation
 - Query-scoped memory reservations with a configurable limit and peak-memory metric
@@ -69,6 +70,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/logical.rs` | Typed logical plan and plan display |
 | `src/optimizer.rs` | Rule-based filter/projection pushdown |
 | `src/planner.rs` | Logical-to-physical lowering |
+| `src/protocol.rs` | Validated coordinator/worker wire contracts |
 | `src/execution.rs` | Async operators, vectorized execution, joins, sorts, aggregates |
 | `src/distributed.rs` | Local scheduler, partial aggregation, Arrow exchange and merge |
 | `src/catalog.rs` | Catalog plus memory, CSV, and Parquet providers |
@@ -84,7 +86,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation runs inside one process. It exercises scheduling, partition tasks, partial aggregation, exchange accounting, and final aggregation, but it does not yet have RPC, remote object storage, retries, heartbeats, or durable shuffle. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The “distributed” implementation runs inside one process. It exercises scheduling, partition tasks, partial aggregation, exchange accounting, and final aggregation. Serializable messages now define future worker registration, heartbeat, lease, task-attempt, cancellation, and shuffle-block boundaries, but no RPC service sends them yet; remote object storage, retries, and durable shuffle are still absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

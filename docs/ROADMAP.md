@@ -75,6 +75,11 @@ Exit criterion: the optimizer chooses explainable plans and improves a represent
 
 ## Phase 4 — real distributed runtime
 
+Foundation: versioned Serde contracts now cover stage fragments, worker registration and
+heartbeats, task attempts and leases, cancellation, task states, and immutable shuffle-block
+metadata. A physical-plan codec, transport, coordinator state machine, and remote execution remain
+open.
+
 Split the current `LocalCluster` seam into:
 
 ```mermaid
@@ -134,5 +139,5 @@ Exit criterion: repeatable deployment, security review, SLOs, runbooks, and reco
 6. Replace row-wise scalar hash keys with encoded Arrow key buffers.
 7. Implement top-K and benchmark it against full sort plus limit. (Implemented.)
 8. Push Parquet row-group predicates using statistics. (Implemented.)
-9. Define serializable stage/partition/task protocol types.
+9. Define serializable stage/partition/task protocol types. (Implemented.)
 10. Replace the memory exchange with a loopback Flight transport before testing multiple hosts.
