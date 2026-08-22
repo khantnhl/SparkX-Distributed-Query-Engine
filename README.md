@@ -83,7 +83,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation runs inside one process. It exercises scheduling, partition tasks, partial aggregation, exchange accounting, and final aggregation, but it does not yet have RPC, remote object storage, retries, heartbeats, or durable shuffle. Operators are in-memory and do not spill. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The “distributed” implementation runs inside one process. It exercises scheduling, partition tasks, partial aggregation, exchange accounting, and final aggregation, but it does not yet have RPC, remote object storage, retries, heartbeats, or durable shuffle. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

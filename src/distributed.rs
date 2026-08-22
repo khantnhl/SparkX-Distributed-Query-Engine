@@ -6,12 +6,17 @@
 //! next scaling step; the physical operators do not change.
 
 use crate::error::{Result, SparkXError};
-use crate::execution::{PhysicalPlan, TaskContext, execute, hash_aggregate};
+use crate::execution::{
+    PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
+};
 use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
+use crate::memory::QueryMemory;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -107,19 +112,29 @@ impl LocalCluster {
                 let _permit = permit;
                 task_context.cancellation.check()?;
                 let cancellation = task_context.cancellation.clone();
-                let batches = execute(input, task_context).collect().await?;
+                let stream = execute(input, task_context.clone());
+                let (batches, _input_reservation) =
+                    collect_with_memory(stream, &task_context.memory).await?;
                 cancellation.check()?;
-                hash_aggregate(&batches, &group_exprs, &partial_exprs, partial_schema)
+                hash_aggregate_with_memory(
+                    &batches,
+                    &group_exprs,
+                    &partial_exprs,
+                    partial_schema,
+                    &task_context.memory,
+                )
             });
         }
 
         let mut partial_batches = Vec::with_capacity(partitions);
+        let mut shuffle_reservation = context.memory.try_reserve(0)?;
         while let Some(result) = tasks.join_next().await {
             context.cancellation.check()?;
             let batch = result.map_err(|error| {
                 SparkXError::execution(format!("worker task failed: {error}"))
             })??;
             context.metrics.add_shuffled_rows(batch.num_rows());
+            shuffle_reservation.try_grow(batch.get_array_memory_size() as u64)?;
             partial_batches.push(batch);
         }
         context.cancellation.check()?;
@@ -128,6 +143,7 @@ impl LocalCluster {
             group_exprs.len(),
             aggregate_exprs,
             schema.clone(),
+            &context.memory,
         )?;
         context
             .metrics
@@ -236,6 +252,7 @@ fn merge_partials(
     group_count: usize,
     aggregates: &[Expr],
     schema: SchemaRef,
+    memory: &QueryMemory,
 ) -> Result<RecordBatch> {
     let functions = aggregates
         .iter()
@@ -246,8 +263,10 @@ fn merge_partials(
             ))),
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut state_reservation = memory.try_reserve(0)?;
     let mut groups: HashMap<Vec<ScalarValue>, Vec<MergeState>> = HashMap::new();
     if group_count == 0 {
+        state_reservation.try_grow(merge_group_memory_bytes(&[], functions.len()))?;
         groups.insert(Vec::new(), new_merge_states(&functions));
     }
 
@@ -256,9 +275,14 @@ fn merge_partials(
             let key = (0..group_count)
                 .map(|column| value_at(batch.column(column).as_ref(), row))
                 .collect::<Result<Vec<_>>>()?;
-            let states = groups
-                .entry(key)
-                .or_insert_with(|| new_merge_states(&functions));
+            let states = match groups.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    state_reservation
+                        .try_grow(merge_group_memory_bytes(entry.key(), functions.len()))?;
+                    entry.insert(new_merge_states(&functions))
+                }
+            };
             let mut column = group_count;
             for (function, state) in functions.iter().zip(states.iter_mut()) {
                 match (function, state) {
@@ -338,6 +362,24 @@ fn merge_partials(
         .map(|(values, field)| scalars_to_array(values, field.data_type()))
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+fn merge_group_memory_bytes(key: &[ScalarValue], state_count: usize) -> u64 {
+    let key_bytes = key
+        .iter()
+        .fold(size_of::<Vec<ScalarValue>>() as u64, |total, value| {
+            let dynamic = match value {
+                ScalarValue::Utf8(value) => value.capacity() as u64,
+                _ => 0,
+            };
+            total
+                .saturating_add(size_of::<ScalarValue>() as u64)
+                .saturating_add(dynamic)
+        });
+    32_u64
+        .saturating_add(key_bytes)
+        .saturating_add(size_of::<Vec<MergeState>>() as u64)
+        .saturating_add((state_count as u64).saturating_mul(size_of::<MergeState>() as u64))
 }
 
 fn new_merge_states(functions: &[AggregateFunction]) -> Vec<MergeState> {

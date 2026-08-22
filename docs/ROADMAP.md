@@ -42,8 +42,8 @@ Exit criterion: a published supported-SQL matrix, deterministic results, and a d
 ## Phase 2 — memory and local performance
 
 In progress: the query-scoped reservation manager, configurable byte limit, typed exhaustion
-error, and peak-memory metric are implemented. Pipeline-breaker accounting, pressure callbacks,
-and spill files remain open.
+error, peak-memory metric, and accounting for blocking native/distributed operators are
+implemented. Pressure callbacks and spill files remain open.
 
 Implement:
 

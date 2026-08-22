@@ -3,7 +3,7 @@ use crate::catalog::TableRef;
 use crate::error::{Result, SparkXError};
 use crate::expr::{AggregateFunction, Expr, ScalarValue, evaluate, scalars_to_array, value_at};
 use crate::logical::{JoinType, SortExpr};
-use crate::memory::QueryMemory;
+use crate::memory::{MemoryReservation, QueryMemory};
 use crate::metrics::MetricsRef;
 use arrow::array::BooleanArray;
 use arrow::compute::kernels::filter::filter_record_batch;
@@ -12,7 +12,9 @@ use arrow::compute::{
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -356,6 +358,20 @@ fn error_receiver(error: SparkXError, channel_capacity: usize) -> BatchReceiver 
     BatchReceiver { receiver }
 }
 
+pub(crate) async fn collect_with_memory(
+    mut input: BatchReceiver,
+    memory: &QueryMemory,
+) -> Result<(Vec<RecordBatch>, MemoryReservation)> {
+    let mut reservation = memory.try_reserve(0)?;
+    let mut batches = Vec::new();
+    while let Some(batch) = input.recv().await {
+        let batch = batch?;
+        reservation.try_grow(batch.get_array_memory_size() as u64)?;
+        batches.push(batch);
+    }
+    Ok((batches, reservation))
+}
+
 fn track_operator_output(
     mut input: BatchReceiver,
     operator_id: OperatorId,
@@ -528,8 +544,14 @@ fn execute_aggregate(
 ) -> BatchReceiver {
     let (sender, receiver) = mpsc::channel(context.channel_capacity);
     tokio::spawn(async move {
-        let result = match input.collect().await {
-            Ok(batches) => hash_aggregate(&batches, &group_exprs, &aggregate_exprs, schema),
+        let result = match collect_with_memory(input, &context.memory).await {
+            Ok((batches, _input_reservation)) => hash_aggregate_with_memory(
+                &batches,
+                &group_exprs,
+                &aggregate_exprs,
+                schema,
+                &context.memory,
+            ),
             Err(error) => Err(error),
         };
         let _ = sender.send(result).await;
@@ -546,11 +568,14 @@ fn execute_sort(
     let (sender, receiver) = mpsc::channel(context.channel_capacity);
     tokio::spawn(async move {
         let result = async {
-            let batches = input.collect().await?;
+            let (batches, _input_reservation) = collect_with_memory(input, &context.memory).await?;
             if batches.is_empty() {
                 return Ok(RecordBatch::new_empty(schema));
             }
             let batch = concat_batches(&schema, &batches)?;
+            let _sort_reservation = context
+                .memory
+                .try_reserve((batch.num_rows() as u64).saturating_mul(size_of::<u64>() as u64))?;
             let columns = exprs
                 .iter()
                 .map(|sort| {
@@ -585,7 +610,11 @@ fn execute_hash_join(
     let (sender, receiver) = mpsc::channel(context.channel_capacity);
     tokio::spawn(async move {
         let result = async {
-            let (left_batches, right_batches) = tokio::try_join!(left.collect(), right.collect())?;
+            let ((left_batches, _left_reservation), (right_batches, _right_reservation)) =
+                tokio::try_join!(
+                    collect_with_memory(left, &context.memory),
+                    collect_with_memory(right, &context.memory)
+                )?;
             hash_join(
                 &left_batches,
                 &right_batches,
@@ -593,6 +622,7 @@ fn execute_hash_join(
                 &left_on,
                 &right_on,
                 schema,
+                &context.memory,
             )
         }
         .await;
@@ -732,6 +762,46 @@ impl AggregateState {
         Ok(())
     }
 
+    fn additional_memory(&self, value: &ScalarValue) -> Result<u64> {
+        if value == &ScalarValue::Null {
+            return Ok(0);
+        }
+        let additional = match self {
+            Self::Count {
+                distinct: Some(values),
+                ..
+            }
+            | Self::Sum {
+                distinct: Some(values),
+                ..
+            }
+            | Self::Avg {
+                distinct: Some(values),
+                ..
+            } if !values.contains(value) => {
+                HASH_ENTRY_OVERHEAD_BYTES.saturating_add(scalar_memory_bytes(value))
+            }
+            Self::Min(current) if should_replace_extreme(current, value, OrderingChoice::Min)? => {
+                scalar_memory_bytes(value).saturating_sub(
+                    current
+                        .as_ref()
+                        .map(scalar_memory_bytes)
+                        .unwrap_or_default(),
+                )
+            }
+            Self::Max(current) if should_replace_extreme(current, value, OrderingChoice::Max)? => {
+                scalar_memory_bytes(value).saturating_sub(
+                    current
+                        .as_ref()
+                        .map(scalar_memory_bytes)
+                        .unwrap_or_default(),
+                )
+            }
+            _ => 0,
+        };
+        Ok(additional)
+    }
+
     fn finish(&self) -> ScalarValue {
         match self {
             Self::Count { value, .. } => ScalarValue::UInt64(*value),
@@ -770,8 +840,19 @@ fn update_extreme(
     candidate: ScalarValue,
     choice: OrderingChoice,
 ) -> Result<()> {
-    if candidate == ScalarValue::Null {
-        return Ok(());
+    if should_replace_extreme(current, &candidate, choice)? {
+        *current = Some(candidate);
+    }
+    Ok(())
+}
+
+fn should_replace_extreme(
+    current: &Option<ScalarValue>,
+    candidate: &ScalarValue,
+    choice: OrderingChoice,
+) -> Result<bool> {
+    if candidate == &ScalarValue::Null {
+        return Ok(false);
     }
     let replace = match current {
         None => true,
@@ -786,10 +867,7 @@ fn update_extreme(
             }
         },
     };
-    if replace {
-        *current = Some(candidate);
-    }
-    Ok(())
+    Ok(replace)
 }
 
 fn numeric_value(value: &ScalarValue) -> Result<f64> {
@@ -809,12 +887,30 @@ pub fn hash_aggregate(
     aggregate_exprs: &[Expr],
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
+    hash_aggregate_with_memory(
+        batches,
+        group_exprs,
+        aggregate_exprs,
+        schema,
+        &QueryMemory::new(u64::MAX),
+    )
+}
+
+pub(crate) fn hash_aggregate_with_memory(
+    batches: &[RecordBatch],
+    group_exprs: &[Expr],
+    aggregate_exprs: &[Expr],
+    schema: SchemaRef,
+    memory: &QueryMemory,
+) -> Result<RecordBatch> {
     let specs = aggregate_exprs
         .iter()
         .map(aggregate_spec)
         .collect::<Result<Vec<_>>>()?;
+    let mut state_reservation = memory.try_reserve(0)?;
     let mut groups: HashMap<Vec<ScalarValue>, Vec<AggregateState>> = HashMap::new();
     if group_exprs.is_empty() {
+        state_reservation.try_grow(aggregate_group_memory_bytes(&[], specs.len()))?;
         groups.insert(
             Vec::new(),
             specs
@@ -842,17 +938,27 @@ pub fn hash_aggregate(
                 .iter()
                 .map(|array| value_at(array.as_ref(), row))
                 .collect::<Result<Vec<_>>>()?;
-            let states = groups.entry(key).or_insert_with(|| {
-                specs
-                    .iter()
-                    .map(|(function, _, distinct)| AggregateState::new(*function, *distinct))
-                    .collect()
-            });
+            let states = match groups.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    state_reservation
+                        .try_grow(aggregate_group_memory_bytes(entry.key(), specs.len()))?;
+                    entry.insert(
+                        specs
+                            .iter()
+                            .map(|(function, _, distinct)| {
+                                AggregateState::new(*function, *distinct)
+                            })
+                            .collect(),
+                    )
+                }
+            };
             for (index, state) in states.iter_mut().enumerate() {
                 let value = match &aggregate_arrays[index] {
                     None => ScalarValue::Boolean(true),
                     Some(array) => value_at(array.as_ref(), row)?,
                 };
+                state_reservation.try_grow(state.additional_memory(&value)?)?;
                 state.update(value)?;
             }
         }
@@ -876,6 +982,32 @@ pub fn hash_aggregate(
         .map(|(values, field)| scalars_to_array(values, field.data_type()))
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+const HASH_ENTRY_OVERHEAD_BYTES: u64 = 32;
+
+fn scalar_memory_bytes(value: &ScalarValue) -> u64 {
+    let inline = size_of::<ScalarValue>() as u64;
+    match value {
+        ScalarValue::Utf8(value) => inline.saturating_add(value.capacity() as u64),
+        _ => inline,
+    }
+}
+
+fn scalar_vec_memory_bytes(values: &[ScalarValue]) -> u64 {
+    (size_of::<Vec<ScalarValue>>() as u64).saturating_add(
+        values
+            .iter()
+            .map(scalar_memory_bytes)
+            .fold(0_u64, u64::saturating_add),
+    )
+}
+
+fn aggregate_group_memory_bytes(key: &[ScalarValue], state_count: usize) -> u64 {
+    HASH_ENTRY_OVERHEAD_BYTES
+        .saturating_add(scalar_vec_memory_bytes(key))
+        .saturating_add(size_of::<Vec<AggregateState>>() as u64)
+        .saturating_add((state_count as u64).saturating_mul(size_of::<AggregateState>() as u64))
 }
 
 fn aggregate_spec(expr: &Expr) -> Result<(AggregateFunction, Expr, bool)> {
@@ -909,6 +1041,7 @@ fn hash_join(
     left_on: &[Expr],
     right_on: &[Expr],
     schema: SchemaRef,
+    memory: &QueryMemory,
 ) -> Result<RecordBatch> {
     let right_width = right_batches
         .first()
@@ -921,6 +1054,7 @@ fn hash_join(
                     .unwrap_or(0),
             )
         });
+    let mut state_reservation = memory.try_reserve(0)?;
     let mut build: HashMap<Vec<ScalarValue>, Vec<Vec<ScalarValue>>> = HashMap::new();
     for batch in right_batches {
         let keys = right_on
@@ -940,7 +1074,21 @@ fn hash_join(
                 .iter()
                 .map(|array| value_at(array.as_ref(), row))
                 .collect::<Result<Vec<_>>>()?;
-            build.entry(key).or_default().push(values);
+            let row_bytes = scalar_vec_memory_bytes(&values);
+            match build.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    state_reservation.try_grow(row_bytes)?;
+                    entry.get_mut().push(values);
+                }
+                Entry::Vacant(entry) => {
+                    let entry_bytes = HASH_ENTRY_OVERHEAD_BYTES
+                        .saturating_add(scalar_vec_memory_bytes(entry.key()))
+                        .saturating_add(size_of::<Vec<Vec<ScalarValue>>>() as u64)
+                        .saturating_add(row_bytes);
+                    state_reservation.try_grow(entry_bytes)?;
+                    entry.insert(vec![values]);
+                }
+            }
         }
     }
 
@@ -964,11 +1112,13 @@ fn hash_join(
                 for right_values in matches {
                     let mut output = left_values.clone();
                     output.extend(right_values.clone());
+                    state_reservation.try_grow(scalar_vec_memory_bytes(&output))?;
                     output_rows.push(output);
                 }
             } else if join_type == JoinType::Left {
                 let mut output = left_values;
                 output.extend(std::iter::repeat_n(ScalarValue::Null, right_width));
+                state_reservation.try_grow(scalar_vec_memory_bytes(&output))?;
                 output_rows.push(output);
             }
         }

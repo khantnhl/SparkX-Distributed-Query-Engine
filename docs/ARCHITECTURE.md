@@ -139,11 +139,12 @@ Pipeline breakers collect their input:
 - Sort concatenates batches and produces global lexicographic indices.
 - Hash join builds a key-to-row-index map on the right, then emits matched (or left-null-extended) rows.
 
-Each task context carries a query-scoped memory manager. Blocking operators can acquire RAII
-reservations against the configured byte limit; exceeding it returns
-`SparkXError::ResourceExhausted`, and dropping a reservation returns its bytes. The manager records
-current and peak reservations. This establishes the enforcement contract before operator
-accounting, spill files, and pressure callbacks are introduced.
+Each task context carries a query-scoped memory manager. Buffered pipeline-breaker input, aggregate
+and join hash state, sort indices, and local-distributed partial/shuffle state acquire RAII
+reservations against the configured byte limit. Arrow batches use their reported allocation size;
+Rust hash structures use conservative retained-value estimates. Exceeding the limit returns
+`SparkXError::ResourceExhausted`, and dropping a reservation returns its bytes. Spill files and
+pressure callbacks remain future work.
 
 ### 6. Local distributed execution
 
