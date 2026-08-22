@@ -21,6 +21,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Two-stage partial/final distributed aggregation with an Arrow exchange boundary
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing metrics, and cooperative query cancellation
+- Query-scoped memory reservations with a configurable limit and peak-memory metric
 - Integration, golden-plan, and DuckDB differential tests plus Criterion benchmarks
 
 ## Quick start
@@ -71,6 +72,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/distributed.rs` | Local scheduler, partial aggregation, Arrow exchange and merge |
 | `src/catalog.rs` | Catalog plus memory, CSV, and Parquet providers |
 | `src/expr.rs` | Expression tree, type inference, Arrow kernels, scalar state |
+| `src/memory.rs` | Query memory limits and RAII reservations |
 | `src/metrics.rs` | Lock-free query counters and snapshots |
 | `benches/engine.rs` | Expression and end-to-end Criterion benchmarks |
 | `tests/engine.rs` | SQL, optimizer, I/O, join, and distributed correctness tests |

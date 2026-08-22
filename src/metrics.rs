@@ -15,6 +15,8 @@ pub struct QueryMetrics {
     shuffled_rows: AtomicU64,
     tasks: AtomicU64,
     elapsed_ns: AtomicU64,
+    memory_reserved_bytes: AtomicU64,
+    memory_peak_bytes: AtomicU64,
     operators: Mutex<BTreeMap<u32, OperatorMetricsSnapshot>>,
 }
 
@@ -30,6 +32,8 @@ pub struct MetricsSnapshot {
     pub shuffled_rows: u64,
     pub tasks: u64,
     pub elapsed_ns: u64,
+    pub memory_reserved_bytes: u64,
+    pub memory_peak_bytes: u64,
     pub operators: Vec<OperatorMetricsSnapshot>,
 }
 
@@ -68,6 +72,12 @@ impl QueryMetrics {
     pub fn set_elapsed(&self, elapsed: Duration) {
         self.elapsed_ns
             .store(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_memory_usage(&self, reserved_bytes: u64, peak_bytes: u64) {
+        self.memory_reserved_bytes
+            .store(reserved_bytes, Ordering::Relaxed);
+        self.memory_peak_bytes.store(peak_bytes, Ordering::Relaxed);
     }
 
     pub fn record_operator_output(&self, operator_id: u32, name: &str, rows: usize) {
@@ -109,6 +119,8 @@ impl QueryMetrics {
             shuffled_rows: self.shuffled_rows.load(Ordering::Relaxed),
             tasks: self.tasks.load(Ordering::Relaxed),
             elapsed_ns: self.elapsed_ns.load(Ordering::Relaxed),
+            memory_reserved_bytes: self.memory_reserved_bytes.load(Ordering::Relaxed),
+            memory_peak_bytes: self.memory_peak_bytes.load(Ordering::Relaxed),
             operators: self.operators.lock().values().cloned().collect(),
         }
     }

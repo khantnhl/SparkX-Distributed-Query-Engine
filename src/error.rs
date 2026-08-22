@@ -28,6 +28,9 @@ pub enum SparkXError {
     #[error("resource not found: {0}")]
     NotFound(String),
 
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     #[error("query was cancelled")]
     Cancelled,
 
@@ -46,5 +49,9 @@ impl SparkXError {
 
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::Unsupported(message.into())
+    }
+
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self::ResourceExhausted(message.into())
     }
 }

@@ -42,6 +42,7 @@ fn session(distributed: bool) -> Session {
         channel_capacity: 1,
         workers: 2,
         distributed,
+        ..SessionConfig::default()
     });
     let partitions = (0..4)
         .map(|partition| vec![sales_batch(partition * 2)])
@@ -60,10 +61,12 @@ fn normalizes_zero_resource_settings() {
         channel_capacity: 0,
         workers: 0,
         distributed: false,
+        memory_limit_bytes: 0,
     });
     assert_eq!(session.config().batch_size, 1);
     assert_eq!(session.config().channel_capacity, 1);
     assert_eq!(session.config().workers, 1);
+    assert_eq!(session.config().memory_limit_bytes, 1);
 }
 
 #[tokio::test]

@@ -11,6 +11,7 @@ pub mod error;
 pub mod execution;
 pub mod expr;
 pub mod logical;
+pub mod memory;
 pub mod metrics;
 pub mod optimizer;
 pub mod planner;
@@ -18,4 +19,5 @@ pub mod session;
 
 pub use cancellation::CancellationToken;
 pub use error::{Result, SparkXError};
+pub use memory::{DEFAULT_MEMORY_LIMIT_BYTES, MemoryReservation, QueryMemory};
 pub use session::{QueryResult, Session, SessionConfig};

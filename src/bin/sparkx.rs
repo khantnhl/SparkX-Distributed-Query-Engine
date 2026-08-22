@@ -52,6 +52,10 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     channel_capacity: usize,
 
+    /// Maximum memory reserved by blocking operators in one query.
+    #[arg(long, default_value_t = sparkx::DEFAULT_MEMORY_LIMIT_BYTES)]
+    memory_limit_bytes: u64,
+
     /// Print optimized and physical plans after execution.
     #[arg(long)]
     show_plan: bool,
@@ -76,6 +80,7 @@ async fn run() -> Result<()> {
         channel_capacity: args.channel_capacity.max(1),
         workers: args.workers.max(1),
         distributed: args.distributed,
+        memory_limit_bytes: args.memory_limit_bytes.max(1),
     });
     let format = match args.format {
         InputFormat::Auto => match args

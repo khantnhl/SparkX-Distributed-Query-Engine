@@ -77,6 +77,7 @@ fn session(distributed: bool) -> Session {
         channel_capacity: 2,
         workers: 4,
         distributed,
+        ..SessionConfig::default()
     });
     session.register_memory(
         "sales",

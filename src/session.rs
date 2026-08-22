@@ -5,6 +5,7 @@ use crate::error::{Result, SparkXError};
 use crate::execution::{TaskContext, execute};
 use crate::expr::{AggregateFunction, Expr, Operator, ScalarValue};
 use crate::logical::{JoinType, LogicalPlan, SortExpr};
+use crate::memory::{DEFAULT_MEMORY_LIMIT_BYTES, QueryMemory};
 use crate::metrics::{MetricsSnapshot, QueryMetrics};
 use crate::optimizer::Optimizer;
 use crate::planner::PhysicalPlanner;
@@ -28,6 +29,7 @@ pub struct SessionConfig {
     pub channel_capacity: usize,
     pub workers: usize,
     pub distributed: bool,
+    pub memory_limit_bytes: u64,
 }
 
 impl Default for SessionConfig {
@@ -37,6 +39,7 @@ impl Default for SessionConfig {
             channel_capacity: 2,
             workers: num_cpus::get().max(1),
             distributed: false,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
         }
     }
 }
@@ -76,6 +79,7 @@ impl Session {
             channel_capacity: config.channel_capacity.max(1),
             workers: config.workers.max(1),
             distributed: config.distributed,
+            memory_limit_bytes: config.memory_limit_bytes.max(1),
         };
         Self {
             config,
@@ -169,11 +173,13 @@ impl Session {
         let physical = PhysicalPlanner::create_physical_plan(&optimized, &self.catalog)?;
         let physical_text = physical.explain();
         let metrics = Arc::new(QueryMetrics::default());
+        let memory = QueryMemory::new(self.config.memory_limit_bytes);
         let context = TaskContext {
             batch_size: self.config.batch_size,
             channel_capacity: self.config.channel_capacity,
             partition: None,
             metrics: metrics.clone(),
+            memory: memory.clone(),
             cancellation,
         };
         let started = Instant::now();
@@ -189,6 +195,7 @@ impl Session {
             metrics.record_output(batch.num_rows());
         }
         metrics.set_elapsed(started.elapsed());
+        metrics.set_memory_usage(memory.reserved_bytes(), memory.peak_bytes());
         Ok(QueryResult {
             batches,
             metrics: metrics.snapshot(),

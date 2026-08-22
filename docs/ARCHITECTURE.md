@@ -139,6 +139,12 @@ Pipeline breakers collect their input:
 - Sort concatenates batches and produces global lexicographic indices.
 - Hash join builds a key-to-row-index map on the right, then emits matched (or left-null-extended) rows.
 
+Each task context carries a query-scoped memory manager. Blocking operators can acquire RAII
+reservations against the configured byte limit; exceeding it returns
+`SparkXError::ResourceExhausted`, and dropping a reservation returns its bytes. The manager records
+current and peak reservations. This establishes the enforcement contract before operator
+accounting, spill files, and pressure callbacks are introduced.
+
 ### 6. Local distributed execution
 
 The cluster path is used when a physical plan ends in a hash aggregate over a multi-partition, non-join input.
@@ -175,8 +181,9 @@ wall-clock nanoseconds. `QueryResult` also preserves all three plan texts and ru
 
 The physical planner assigns deterministic pre-order IDs (`LimitExec#0`, `SortExec#1`, and so on).
 Every operator records emitted rows/batches and elapsed nanoseconds under its ID; repeated
-partition attempts aggregate into the same operator entry. A production version would add input
-and peak-memory counters, histograms, spill bytes, remote fetch time, and OpenTelemetry spans.
+partition attempts aggregate into the same operator entry. Query metrics also report current and
+peak reserved memory. A production version would add per-operator memory, histograms, spill bytes,
+remote fetch time, and OpenTelemetry spans.
 
 ## Core invariants
 

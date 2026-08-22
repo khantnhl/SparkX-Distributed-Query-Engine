@@ -3,6 +3,7 @@ use crate::catalog::TableRef;
 use crate::error::{Result, SparkXError};
 use crate::expr::{AggregateFunction, Expr, ScalarValue, evaluate, scalars_to_array, value_at};
 use crate::logical::{JoinType, SortExpr};
+use crate::memory::QueryMemory;
 use crate::metrics::MetricsRef;
 use arrow::array::BooleanArray;
 use arrow::compute::kernels::filter::filter_record_batch;
@@ -230,6 +231,7 @@ pub struct TaskContext {
     pub channel_capacity: usize,
     pub partition: Option<usize>,
     pub metrics: MetricsRef,
+    pub memory: QueryMemory,
     pub cancellation: CancellationToken,
 }
 
