@@ -1,0 +1,13 @@
+== Logical Plan ==
+Project: [#region, #orders, #revenue]
+  Aggregate: group=[#region] aggr=[COUNT(*) AS orders, SUM(#amount) AS revenue]
+    Filter: (#amount > 10)
+      Scan: sales
+
+== Optimized Logical Plan ==
+Aggregate: group=[#region] aggr=[COUNT(*) AS orders, SUM(#amount) AS revenue]
+  Scan: sales filters=[(#amount > 10)]
+
+== Physical Plan ==
+HashAggregateExec#0: group=[#region] aggr=[COUNT(*) AS orders, SUM(#amount) AS revenue]
+  Parquet/Csv/MemoryScanExec#1: sales partitions=1 projection=None filters=[(#amount > 10)]

@@ -1,0 +1,18 @@
+== Logical Plan ==
+Limit: 2
+  Sort: [#id DESC]
+    Project: [#id, #amount]
+      Filter: (#amount >= 22)
+        Scan: sales
+
+== Optimized Logical Plan ==
+Limit: 2
+  Sort: [#id DESC]
+    Project: [#id, #amount]
+      Scan: sales projection=["sales.amount", "sales.id"] filters=[(#amount >= 22)]
+
+== Physical Plan ==
+LimitExec#0: 2
+  SortExec#1: [#id DESC]
+    ProjectionExec#2: [#id, #amount]
+      Parquet/Csv/MemoryScanExec#3: sales partitions=1 projection=Some([3, 0]) filters=[(#amount >= 22)]

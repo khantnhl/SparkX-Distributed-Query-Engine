@@ -1,0 +1,20 @@
+== Logical Plan ==
+Project: [#s.id, #c.name]
+  Filter: (#s.amount > 10)
+    HashJoin: Inner on [#s.customer_id = #c.id]
+      Scan: sales
+      Scan: customers
+
+== Optimized Logical Plan ==
+Project: [#s.id, #c.name]
+  Filter: (#s.amount > 10)
+    HashJoin: Inner on [#s.customer_id = #c.id]
+      Scan: sales
+      Scan: customers
+
+== Physical Plan ==
+ProjectionExec#0: [#s.id, #c.name]
+  FilterExec#1: (#s.amount > 10)
+    HashJoinExec#2: Inner [#s.customer_id = #c.id]
+      Parquet/Csv/MemoryScanExec#3: sales partitions=1 projection=None
+      Parquet/Csv/MemoryScanExec#4: customers partitions=1 projection=None
