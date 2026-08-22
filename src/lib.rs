@@ -15,6 +15,7 @@ pub mod memory;
 pub mod metrics;
 pub mod optimizer;
 pub mod planner;
+mod pruning;
 pub mod session;
 
 pub use cancellation::CancellationToken;

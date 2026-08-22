@@ -102,4 +102,4 @@ Comparisons must pin versions, compression, threads, cache state, output materia
 6. Run correctness tests and the whole suite to catch shifted costs.
 7. Keep improvements only when the gain is repeatable and memory/latency do not regress unexpectedly.
 
-The physical Top-K path now gives `ORDER BY ... LIMIT` its own benchmark next to a full sort. The next high-likelihood wins are partition pruning and Parquet predicate pushdown, avoiding scalar materialization in hash keys, a radix/Swiss-table aggregate implementation, streaming output from joins, memory pooling, and code-generated/fused expression pipelines.
+The physical Top-K path now gives `ORDER BY ... LIMIT` its own benchmark next to a full sort, and Parquet scans can skip row groups from footer statistics. The next high-likelihood wins are page/bloom pruning and reader-level Parquet predicates, avoiding scalar materialization in hash keys, a radix/Swiss-table aggregate implementation, streaming output from joins, memory pooling, and code-generated/fused expression pipelines.

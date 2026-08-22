@@ -464,6 +464,17 @@ fn execute_scan(
         .unwrap_or_else(|| (0..provider.partition_count()).collect());
 
     for partition in partitions {
+        match provider.partition_may_match(partition, &filters) {
+            Ok(true) => {}
+            Ok(false) => {
+                context.metrics.add_pruned_partition();
+                continue;
+            }
+            Err(error) => {
+                let _ = sender.try_send(Err(error));
+                continue;
+            }
+        }
         let provider = provider.clone();
         let projection = projection.clone();
         let filters = filters.clone();

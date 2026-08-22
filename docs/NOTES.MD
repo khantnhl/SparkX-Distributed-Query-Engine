@@ -28,6 +28,8 @@ More independent partitions generally allow more scan parallelism.
 
 estimated_bytes() estimates how much data the table contains. Cost-based optimizer could use it to choose between plans.
 
+partition_may_match(partition, filters) lets a storage adapter skip a partition when metadata proves its rows cannot match. Parquet uses row-group min/max/null statistics; uncertain cases are always read.
+
 scan_partition(partition, projection, batch_size) performs the actual read.
 partition — which independent piece to read.
 projection — which columns are actually needed.

@@ -756,6 +756,125 @@ async fn reads_parquet_row_groups_as_partitions() {
     assert_eq!(result.metrics.shuffled_rows, 2);
 }
 
+#[tokio::test]
+async fn prunes_parquet_row_groups_with_column_statistics() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pruned-sales.parquet");
+    let file = File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, sales_schema(), None).unwrap();
+    for offset in [0, 2, 4] {
+        writer.write(&sales_batch(offset)).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+
+    let session = Session::new(SessionConfig::default());
+    session.register_parquet("sales", &path).unwrap();
+
+    let result = session
+        .execute_sql("SELECT id FROM sales WHERE id >= 4 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(result.row_count(), 2);
+    assert_eq!(result.metrics.input_rows, 2);
+    assert_eq!(result.metrics.tasks, 1);
+    assert_eq!(result.metrics.pruned_partitions, 2);
+
+    let reversed = session
+        .execute_sql("SELECT id FROM sales WHERE 4 <= id")
+        .await
+        .unwrap();
+    assert_eq!(reversed.row_count(), 2);
+    assert_eq!(reversed.metrics.pruned_partitions, 2);
+
+    let impossible = session
+        .execute_sql("SELECT id FROM sales WHERE id < 0 OR id > 100")
+        .await
+        .unwrap();
+    assert_eq!(impossible.row_count(), 0);
+    assert_eq!(impossible.metrics.input_rows, 0);
+    assert_eq!(impossible.metrics.tasks, 0);
+    assert_eq!(impossible.metrics.pruned_partitions, 3);
+
+    let impossible_string = session
+        .execute_sql("SELECT id FROM sales WHERE region = 'zzz'")
+        .await
+        .unwrap();
+    assert_eq!(impossible_string.row_count(), 0);
+    assert_eq!(impossible_string.metrics.pruned_partitions, 3);
+
+    let impossible_null = session
+        .execute_sql("SELECT id FROM sales WHERE id IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(impossible_null.row_count(), 0);
+    assert_eq!(impossible_null.metrics.pruned_partitions, 3);
+
+    let distributed = Session::new(SessionConfig {
+        distributed: true,
+        workers: 2,
+        ..SessionConfig::default()
+    });
+    distributed.register_parquet("sales", &path).unwrap();
+    let aggregate = distributed
+        .execute_sql("SELECT COUNT(*) AS rows FROM sales WHERE id >= 4")
+        .await
+        .unwrap();
+    assert_eq!(
+        value_at(aggregate.batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::UInt64(2)
+    );
+    assert!(aggregate.distributed);
+    assert_eq!(aggregate.metrics.tasks, 1);
+    assert_eq!(aggregate.metrics.pruned_partitions, 2);
+}
+
+#[tokio::test]
+async fn prunes_parquet_row_groups_with_null_counts() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        true,
+    )]));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("nullable.parquet");
+    let file = File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+    for values in [
+        vec![None, None],
+        vec![Some(1), None],
+        vec![Some(2), Some(3)],
+    ] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+
+    let session = Session::new(SessionConfig::default());
+    session.register_parquet("nullable", &path).unwrap();
+
+    let nulls = session
+        .execute_sql("SELECT value FROM nullable WHERE value IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(nulls.row_count(), 3);
+    assert_eq!(nulls.metrics.input_rows, 4);
+    assert_eq!(nulls.metrics.pruned_partitions, 1);
+
+    let values = session
+        .execute_sql("SELECT value FROM nullable WHERE value IS NOT NULL")
+        .await
+        .unwrap();
+    assert_eq!(values.row_count(), 3);
+    assert_eq!(values.metrics.input_rows, 4);
+    assert_eq!(values.metrics.pruned_partitions, 1);
+}
+
 #[test]
 fn explains_all_three_plan_layers() {
     let explanation = session(false)

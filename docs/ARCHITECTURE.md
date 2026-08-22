@@ -84,9 +84,10 @@ The `TableProvider` trait is the storage boundary:
 - `schema()` exposes the Arrow contract.
 - `partition_count()` tells the scheduler how much scan parallelism exists.
 - `estimated_bytes()` feeds metrics today and cost estimation later.
+- `partition_may_match(partition, filters)` allows conservative metadata pruning before I/O.
 - `scan_partition(partition, projection, batch_size)` returns columnar batches.
 
-`MemoryTable` is the deterministic testing/programmatic source. `CsvTable` infers a schema and streams one file partition. `ParquetTable` maps each row group to a scan partition and applies root-column projection at the reader.
+`MemoryTable` is the deterministic testing/programmatic source. `CsvTable` infers a schema and streams one file partition. `ParquetTable` maps each row group to a scan partition, applies root-column projection at the reader, and skips row groups that exact min/max/null statistics prove cannot satisfy pushed filters.
 
 Future object-store and Iceberg/Delta adapters implement this trait without changing the operator layer.
 
@@ -98,7 +99,7 @@ The optimizer recursively normalizes children and applies three rule families:
 2. A `Filter` directly above a `Scan` becomes a scan filter.
 3. A `Projection` directly above a `Scan` computes the union of output and filter columns, then installs a scan projection.
 
-Filters are currently executed by SparkX after reading a batch; the pushdown annotation is already positioned for Parquet row-group/page pruning later. The optimizer is deterministic, has no statistics, and preserves a readable before/after plan.
+Filters are still evaluated by SparkX after reading a batch for correctness. Before I/O, providers may also use the pushed annotation conservatively: Parquet prunes impossible row groups from footer statistics, while unknown expressions remain scannable. Page and bloom-filter pruning remain open. The optimizer itself is deterministic, has no statistics, and preserves a readable before/after plan.
 
 ### 4. Physical planning
 
@@ -179,7 +180,7 @@ Stage 2 groups partial Arrow rows and merges them. `shuffled_rows` records the s
 ### 7. Observability and query result
 
 Each query receives a shared `QueryMetrics` context. Scans and tasks update input rows/batches,
-estimated bytes, task count, and shuffle rows. The session records output rows/batches and
+estimated bytes, pruned partitions, task count, and shuffle rows. The session records output rows/batches and
 wall-clock nanoseconds. `QueryResult` also preserves all three plan texts and runner/stage metadata.
 
 The physical planner assigns deterministic pre-order IDs (`LimitExec#0`, `SortExec#1`, and so on).

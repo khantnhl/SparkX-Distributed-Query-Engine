@@ -1,10 +1,13 @@
 use crate::error::{Result, SparkXError};
+use crate::expr::Expr;
+use crate::pruning::row_group_may_match;
 use arrow::csv::reader::{Format, ReaderBuilder};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parking_lot::RwLock;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::metadata::ParquetMetaData;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
@@ -15,6 +18,9 @@ pub trait TableProvider: std::fmt::Debug + Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn partition_count(&self) -> usize;
     fn estimated_bytes(&self) -> u64;
+    fn partition_may_match(&self, _partition: usize, _filters: &[Expr]) -> Result<bool> {
+        Ok(true)
+    }
     fn scan_partition(
         &self,
         partition: usize,
@@ -196,7 +202,8 @@ impl TableProvider for CsvTable {
 pub struct ParquetTable {
     path: PathBuf,
     schema: SchemaRef,
-    row_groups: usize,
+    metadata: Arc<ParquetMetaData>,
+    parquet_columns: Vec<Option<usize>>,
     estimated_bytes: u64,
 }
 
@@ -206,10 +213,31 @@ impl ParquetTable {
         let file = File::open(&path)?;
         let estimated_bytes = file.metadata()?.len();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let schema = builder.schema().clone();
+        let parquet_columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut matches = builder
+                    .parquet_schema()
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column)| column.path().parts().first() == Some(field.name()))
+                    .map(|(index, _)| index);
+                let first = matches.next();
+                if matches.next().is_none() {
+                    first
+                } else {
+                    None
+                }
+            })
+            .collect();
         Ok(Self {
             path,
-            schema: builder.schema().clone(),
-            row_groups: builder.metadata().num_row_groups(),
+            schema,
+            metadata: builder.metadata().clone(),
+            parquet_columns,
             estimated_bytes,
         })
     }
@@ -221,11 +249,25 @@ impl TableProvider for ParquetTable {
     }
 
     fn partition_count(&self) -> usize {
-        self.row_groups
+        self.metadata.num_row_groups()
     }
 
     fn estimated_bytes(&self) -> u64 {
         self.estimated_bytes
+    }
+
+    fn partition_may_match(&self, partition: usize, filters: &[Expr]) -> Result<bool> {
+        if partition >= self.metadata.num_row_groups() {
+            return Err(SparkXError::execution(format!(
+                "Parquet source has no row group {partition}"
+            )));
+        }
+        Ok(row_group_may_match(
+            self.schema.as_ref(),
+            &self.parquet_columns,
+            self.metadata.row_group(partition),
+            filters,
+        ))
     }
 
     fn scan_partition(
@@ -234,7 +276,7 @@ impl TableProvider for ParquetTable {
         projection: Option<&[usize]>,
         batch_size: usize,
     ) -> Result<Vec<RecordBatch>> {
-        if partition >= self.row_groups {
+        if partition >= self.metadata.num_row_groups() {
             return Err(SparkXError::execution(format!(
                 "Parquet source has no row group {partition}"
             )));

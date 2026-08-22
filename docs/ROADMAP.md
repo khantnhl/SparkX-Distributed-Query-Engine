@@ -44,7 +44,8 @@ Exit criterion: a published supported-SQL matrix, deterministic results, and a d
 In progress: the query-scoped reservation manager, configurable byte limit, typed exhaustion
 error, peak-memory metric, and accounting for blocking native/distributed operators are
 implemented. Ordered limits now lower to a physical Top-K operator with a paired full-sort
-benchmark. Pressure callbacks and spill files remain open.
+benchmark, and Parquet scans prune impossible row groups using footer statistics. Pressure
+callbacks, spill files, bloom filters, and page pruning remain open.
 
 Implement:
 
@@ -54,7 +55,7 @@ Implement:
 - Dictionary-aware strings and encoded group/join keys
 - Top-K operator for ordered limits (implemented; streaming input reduction remains open)
 - Fused expression evaluation and reusable output buffers
-- Parquet statistics, bloom/page pruning, and real predicate pushdown
+- Parquet row-group statistics pruning (implemented); bloom/page pruning and reader predicates remain open
 - Work-stealing scheduler and NUMA-aware partition sizing
 
 Exit criterion: queries complete with inputs several times larger than RAM; memory never exceeds its configured envelope; local benchmark regressions are gated in CI.
@@ -132,6 +133,6 @@ Exit criterion: repeatable deployment, security review, SLOs, runbooks, and reco
 5. Introduce a memory reservation interface and account all hash tables.
 6. Replace row-wise scalar hash keys with encoded Arrow key buffers.
 7. Implement top-K and benchmark it against full sort plus limit. (Implemented.)
-8. Push Parquet row-group predicates using statistics.
+8. Push Parquet row-group predicates using statistics. (Implemented.)
 9. Define serializable stage/partition/task protocol types.
 10. Replace the memory exchange with a loopback Flight transport before testing multiple hosts.
