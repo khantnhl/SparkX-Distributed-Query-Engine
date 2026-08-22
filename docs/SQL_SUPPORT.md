@@ -68,3 +68,11 @@ natively and report `distributed = false` rather than pretending to be distribut
 
 CSV files expose one partition. Memory tables can contain multiple explicit partitions, and each
 Parquet row group is a partition.
+
+## Verification
+
+`tests/sql/differential.sql` is executed against SparkX in both native and local-distributed modes
+and against an embedded DuckDB reference engine. The checked-in corpus covers filtering,
+projection, `NULL` predicates and Boolean behavior, primitive casts, grouped aggregates, and inner
+and left joins. Golden files under `tests/snapshots` separately lock the logical, optimized, and
+physical explain-plan shapes.

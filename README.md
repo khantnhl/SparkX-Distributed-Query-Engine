@@ -21,7 +21,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Two-stage partial/final distributed aggregation with an Arrow exchange boundary
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing metrics, and cooperative query cancellation
-- Integration tests and Criterion micro/pipeline benchmarks
+- Integration, golden-plan, and DuckDB differential tests plus Criterion benchmarks
 
 ## Quick start
 

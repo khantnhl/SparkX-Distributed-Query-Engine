@@ -32,6 +32,7 @@ tokio = { version = "1.53.1", features = ["fs", "macros", "rt-multi-thread", "sy
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
+duckdb = { version = "~1.10505.0", features = ["bundled"] }
 tempfile = "3.21.0"
 
 [profile.release]
