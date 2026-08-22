@@ -16,6 +16,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Arrow-native columnar batches and vectorized expression kernels
 - CSV and Parquet scans, Parquet row-group partitioning, and in-memory tables
 - Rule-based filter and projection pushdown
+- Limited-sort physical Top-K for `ORDER BY ... LIMIT`
 - Bounded Tokio channels for backpressure between streaming operators
 - Concurrent partition scans and a worker-limited local cluster
 - Two-stage partial/final distributed aggregation with an Arrow exchange boundary

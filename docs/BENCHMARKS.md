@@ -11,7 +11,8 @@ The initial fixture contains 262,144 sales rows in eight Arrow partitions plus a
 | `vectorized_expression` | `amount_gt_50` | Arrow expression dispatch and comparison | rows/s |
 | `native_queries` | `scan_filter_project` | scan channels, predicates, arithmetic projection | rows/s, allocations |
 | `native_queries` | `hash_aggregate` | grouped COUNT/SUM/AVG state updates | rows/s, peak RSS |
-| `native_queries` | `topk_sort` | current full global sort plus limit | rows/s, peak RSS |
+| `native_queries` | `full_sort` | global ordering with all rows returned | rows/s, peak RSS |
+| `native_queries` | `top_k` | limited ordering with 100 rows returned | rows/s, peak RSS |
 | `native_queries` | `hash_join` | dimension build and fact probe | rows/s, peak RSS |
 | `local_cluster` | `two_stage_hash_aggregate` | scheduling, partial states, exchange, final merge | rows/s, shuffle rows |
 
@@ -101,4 +102,4 @@ Comparisons must pin versions, compression, threads, cache state, output materia
 6. Run correctness tests and the whole suite to catch shifted costs.
 7. Keep improvements only when the gain is repeatable and memory/latency do not regress unexpectedly.
 
-The highest-likelihood early wins are partition-pruning and Parquet predicate pushdown, avoiding scalar materialization in hash keys, a radix/Swiss-table aggregate implementation, streaming output from joins, top-K instead of full sort for `ORDER BY ... LIMIT`, memory pooling, and code-generated/fused expression pipelines.
+The physical Top-K path now gives `ORDER BY ... LIMIT` its own benchmark next to a full sort. The next high-likelihood wins are partition pruning and Parquet predicate pushdown, avoiding scalar materialization in hash keys, a radix/Swiss-table aggregate implementation, streaming output from joins, memory pooling, and code-generated/fused expression pipelines.

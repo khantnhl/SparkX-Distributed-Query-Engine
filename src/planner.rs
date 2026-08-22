@@ -96,11 +96,24 @@ impl PhysicalPlanner {
                 input,
                 limit,
                 schema,
-            } => PhysicalPlan::Limit {
-                id,
-                input: Self::build(input, catalog, next_id)?,
-                limit: *limit,
-                schema: schema.clone(),
+            } => match input.as_ref() {
+                LogicalPlan::Sort {
+                    input: sort_input,
+                    exprs,
+                    ..
+                } => PhysicalPlan::TopK {
+                    id,
+                    input: Self::build(sort_input, catalog, next_id)?,
+                    exprs: exprs.clone(),
+                    limit: *limit,
+                    schema: schema.clone(),
+                },
+                _ => PhysicalPlan::Limit {
+                    id,
+                    input: Self::build(input, catalog, next_id)?,
+                    limit: *limit,
+                    schema: schema.clone(),
+                },
             },
             LogicalPlan::Join {
                 left,

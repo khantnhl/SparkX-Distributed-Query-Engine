@@ -56,6 +56,13 @@ pub enum PhysicalPlan {
         exprs: Vec<SortExpr>,
         schema: SchemaRef,
     },
+    TopK {
+        id: OperatorId,
+        input: Arc<PhysicalPlan>,
+        exprs: Vec<SortExpr>,
+        limit: usize,
+        schema: SchemaRef,
+    },
     Limit {
         id: OperatorId,
         input: Arc<PhysicalPlan>,
@@ -81,6 +88,7 @@ impl PhysicalPlan {
             | Self::Filter { id, .. }
             | Self::HashAggregate { id, .. }
             | Self::Sort { id, .. }
+            | Self::TopK { id, .. }
             | Self::Limit { id, .. }
             | Self::HashJoin { id, .. } => *id,
         }
@@ -93,6 +101,7 @@ impl PhysicalPlan {
             Self::Filter { .. } => "Filter",
             Self::HashAggregate { .. } => "HashAggregate",
             Self::Sort { .. } => "Sort",
+            Self::TopK { .. } => "TopK",
             Self::Limit { .. } => "Limit",
             Self::HashJoin { .. } => "HashJoin",
         }
@@ -105,6 +114,7 @@ impl PhysicalPlan {
             | Self::Filter { schema, .. }
             | Self::HashAggregate { schema, .. }
             | Self::Sort { schema, .. }
+            | Self::TopK { schema, .. }
             | Self::Limit { schema, .. }
             | Self::HashJoin { schema, .. } => schema.clone(),
         }
@@ -180,6 +190,27 @@ impl PhysicalPlan {
             } => {
                 output.push_str(&format!(
                     "SortExec#{id}: [{}]\n",
+                    exprs
+                        .iter()
+                        .map(|sort| format!(
+                            "{} {}",
+                            sort.expr,
+                            if sort.ascending { "ASC" } else { "DESC" }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                input.format_into(indent + 1, output);
+            }
+            Self::TopK {
+                id,
+                input,
+                exprs,
+                limit,
+                ..
+            } => {
+                output.push_str(&format!(
+                    "TopKExec#{id}: limit={limit} sort=[{}]\n",
                     exprs
                         .iter()
                         .map(|sort| format!(
@@ -315,6 +346,16 @@ pub fn execute(plan: Arc<PhysicalPlan>, context: TaskContext) -> BatchReceiver {
         } => {
             let child = execute(input.clone(), context.clone());
             execute_sort(child, exprs.clone(), schema.clone(), context)
+        }
+        PhysicalPlan::TopK {
+            input,
+            exprs,
+            limit,
+            schema,
+            ..
+        } => {
+            let child = execute(input.clone(), context.clone());
+            execute_topk(child, exprs.clone(), *limit, schema.clone(), context)
         }
         PhysicalPlan::Limit { input, limit, .. } => {
             let child = execute(input.clone(), context.clone());
@@ -573,6 +614,9 @@ fn execute_sort(
                 return Ok(RecordBatch::new_empty(schema));
             }
             let batch = concat_batches(&schema, &batches)?;
+            let _concat_reservation = context
+                .memory
+                .try_reserve(batch.get_array_memory_size() as u64)?;
             let _sort_reservation = context
                 .memory
                 .try_reserve((batch.num_rows() as u64).saturating_mul(size_of::<u64>() as u64))?;
@@ -589,6 +633,49 @@ fn execute_sort(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let indices = lexsort_to_indices(&columns, None)?;
+            Ok(take_record_batch(&batch, &indices)?)
+        }
+        .await;
+        let _ = sender.send(result).await;
+    });
+    BatchReceiver { receiver }
+}
+
+fn execute_topk(
+    input: BatchReceiver,
+    exprs: Vec<SortExpr>,
+    limit: usize,
+    schema: SchemaRef,
+    context: TaskContext,
+) -> BatchReceiver {
+    let (sender, receiver) = mpsc::channel(context.channel_capacity);
+    tokio::spawn(async move {
+        let result = async {
+            let (batches, _input_reservation) = collect_with_memory(input, &context.memory).await?;
+            if batches.is_empty() || limit == 0 {
+                return Ok(RecordBatch::new_empty(schema));
+            }
+            let batch = concat_batches(&schema, &batches)?;
+            let _concat_reservation = context
+                .memory
+                .try_reserve(batch.get_array_memory_size() as u64)?;
+            let selected = limit.min(batch.num_rows());
+            let _topk_reservation = context
+                .memory
+                .try_reserve((batch.num_rows() as u64).saturating_mul(size_of::<u64>() as u64))?;
+            let columns = exprs
+                .iter()
+                .map(|sort| {
+                    Ok(SortColumn {
+                        values: evaluate(&sort.expr, &batch)?,
+                        options: Some(SortOptions {
+                            descending: !sort.ascending,
+                            nulls_first: sort.nulls_first,
+                        }),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let indices = lexsort_to_indices(&columns, Some(selected))?;
             Ok(take_record_batch(&batch, &indices)?)
         }
         .await;

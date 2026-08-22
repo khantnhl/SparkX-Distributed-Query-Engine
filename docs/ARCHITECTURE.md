@@ -111,6 +111,7 @@ The physical planner resolves scan column names to provider indices and lowers e
 | Filter | Boolean mask | Yes |
 | Aggregate | Hash aggregate | No; pipeline breaker |
 | Sort | Lexicographic sort | No; pipeline breaker |
+| Top-K | Limited lexicographic sort | No; pipeline breaker |
 | Limit | Row-budget slicer | Yes |
 | Join | Build/probe hash join | No; pipeline breaker |
 
@@ -137,10 +138,11 @@ Pipeline breakers collect their input:
 
 - Hash aggregate stores one state vector per grouping key.
 - Sort concatenates batches and produces global lexicographic indices.
+- Top-K also concatenates its input, but uses Arrow's limited sort and materializes only the best `K` rows. Its current index workspace may still scale with input size.
 - Hash join builds a key-to-row-index map on the right, then emits matched (or left-null-extended) rows.
 
 Each task context carries a query-scoped memory manager. Buffered pipeline-breaker input, aggregate
-and join hash state, sort indices, and local-distributed partial/shuffle state acquire RAII
+and join hash state, full-sort or Top-K index working sets, and local-distributed partial/shuffle state acquire RAII
 reservations against the configured byte limit. Arrow batches use their reported allocation size;
 Rust hash structures use conservative retained-value estimates. Exceeding the limit returns
 `SparkXError::ResourceExhausted`, and dropping a reservation returns its bytes. Spill files and

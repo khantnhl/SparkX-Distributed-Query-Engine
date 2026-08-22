@@ -193,6 +193,22 @@ async fn filters_projects_sorts_and_limits() {
     assert!(result.metrics.input_rows >= 8);
 }
 
+#[test]
+fn plans_only_ordered_limits_as_topk() {
+    let ordered = session(false)
+        .explain("SELECT id FROM sales ORDER BY id DESC LIMIT 3")
+        .unwrap();
+    assert!(ordered.contains("TopKExec#0"));
+    assert!(!ordered.contains("SortExec"));
+    assert!(!ordered.contains("LimitExec"));
+
+    let unordered = session(false)
+        .explain("SELECT id FROM sales LIMIT 3")
+        .unwrap();
+    assert!(unordered.contains("LimitExec#0"));
+    assert!(!unordered.contains("TopKExec"));
+}
+
 #[tokio::test]
 async fn preserves_aliases_and_coerces_mixed_numeric_arithmetic() {
     let result = session(false)
@@ -760,10 +776,9 @@ async fn physical_operator_ids_and_metrics_are_stable() {
     let second = session(false).execute_sql(sql).await.unwrap();
 
     assert_eq!(first.physical_plan, second.physical_plan);
-    assert!(first.physical_plan.contains("LimitExec#0"));
-    assert!(first.physical_plan.contains("SortExec#1"));
-    assert!(first.physical_plan.contains("ProjectionExec#2"));
-    assert!(first.physical_plan.contains("ScanExec#3"));
+    assert!(first.physical_plan.contains("TopKExec#0"));
+    assert!(first.physical_plan.contains("ProjectionExec#1"));
+    assert!(first.physical_plan.contains("ScanExec#2"));
 
     let operators = first
         .metrics
@@ -771,10 +786,7 @@ async fn physical_operator_ids_and_metrics_are_stable() {
         .iter()
         .map(|operator| (operator.operator_id, operator.name.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(
-        operators,
-        vec![(0, "Limit"), (1, "Sort"), (2, "Projection"), (3, "Scan")]
-    );
+    assert_eq!(operators, vec![(0, "TopK"), (1, "Projection"), (2, "Scan")]);
     assert!(
         first
             .metrics

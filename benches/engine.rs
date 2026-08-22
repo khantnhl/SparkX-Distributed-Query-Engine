@@ -118,7 +118,11 @@ fn query_pipeline(c: &mut Criterion) {
             "SELECT region, COUNT(*) AS rows, SUM(amount) AS revenue, AVG(amount) AS average FROM sales GROUP BY region",
         ),
         (
-            "topk_sort",
+            "full_sort",
+            "SELECT id, amount FROM sales ORDER BY amount DESC",
+        ),
+        (
+            "top_k",
             "SELECT id, amount FROM sales ORDER BY amount DESC LIMIT 100",
         ),
         (

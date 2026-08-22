@@ -170,6 +170,7 @@ fn contains_join(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::HashAggregate { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopK { input, .. }
         | PhysicalPlan::Limit { input, .. } => contains_join(input),
         PhysicalPlan::Scan { .. } => false,
     }
@@ -182,6 +183,7 @@ fn scan_partitions(plan: &PhysicalPlan) -> Option<usize> {
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::HashAggregate { input, .. }
         | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopK { input, .. }
         | PhysicalPlan::Limit { input, .. } => scan_partitions(input),
         PhysicalPlan::HashJoin { .. } => None,
     }

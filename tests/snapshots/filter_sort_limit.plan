@@ -12,7 +12,6 @@ Limit: 2
       Scan: sales projection=["sales.amount", "sales.id"] filters=[(#amount >= 22)]
 
 == Physical Plan ==
-LimitExec#0: 2
-  SortExec#1: [#id DESC]
-    ProjectionExec#2: [#id, #amount]
-      Parquet/Csv/MemoryScanExec#3: sales partitions=1 projection=Some([3, 0]) filters=[(#amount >= 22)]
+TopKExec#0: limit=2 sort=[#id DESC]
+  ProjectionExec#1: [#id, #amount]
+    Parquet/Csv/MemoryScanExec#2: sales partitions=1 projection=Some([3, 0]) filters=[(#amount >= 22)]
