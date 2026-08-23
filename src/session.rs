@@ -185,7 +185,7 @@ impl Session {
         let started = Instant::now();
         let (batches, distributed, stages) = if self.config.distributed {
             let result = LocalCluster::new(self.config.workers)
-                .execute(physical, context)
+                .execute(physical, self.catalog.clone(), context)
                 .await?;
             (result.batches, result.distributed, result.stages)
         } else {

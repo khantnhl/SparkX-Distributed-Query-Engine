@@ -1,9 +1,11 @@
 //! In-process distributed runner.
 //!
 //! It schedules partition tasks onto a bounded worker pool, produces Arrow partial aggregates,
-//! sends them through a query-scoped loopback Arrow Flight exchange, and merges them. Moving the
-//! same transport boundary to remote workers still requires plan serialization and coordination.
+//! sends them through a query-scoped loopback Arrow Flight exchange, and merges them. Worker input
+//! crosses the physical-plan codec boundary; moving execution off-process still requires remote
+//! coordination and task RPC handlers.
 
+use crate::catalog::Catalog;
 use crate::error::{Result, SparkXError};
 use crate::execution::{
     PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
@@ -11,6 +13,7 @@ use crate::execution::{
 use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
 use crate::flight_exchange::{LoopbackFlightExchange, ShuffleExchange};
 use crate::memory::QueryMemory;
+use crate::plan_codec::PhysicalPlanCodec;
 use crate::row_key::{EncodedKey, RowKeyEncoder, encoded_key_memory_bytes};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -44,6 +47,7 @@ impl LocalCluster {
     pub async fn execute(
         &self,
         plan: Arc<PhysicalPlan>,
+        catalog: Arc<Catalog>,
         context: TaskContext,
     ) -> Result<ClusterResult> {
         context.cancellation.check()?;
@@ -94,6 +98,10 @@ impl LocalCluster {
         let started = Instant::now();
         let partial_exprs = partial_aggregate_exprs(aggregate_exprs)?;
         let partial_schema = aggregate_schema(input.schema(), group_exprs, &partial_exprs)?;
+        let worker_input = PhysicalPlanCodec::decode(
+            &PhysicalPlanCodec::encode(input.as_ref())?,
+            catalog.as_ref(),
+        )?;
         let semaphore = Arc::new(Semaphore::new(self.workers));
         let mut tasks = JoinSet::new();
 
@@ -102,7 +110,7 @@ impl LocalCluster {
             let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                 SparkXError::execution("local cluster worker pool closed unexpectedly")
             })?;
-            let input = input.clone();
+            let input = worker_input.clone();
             let group_exprs = group_exprs.clone();
             let partial_exprs = partial_exprs.clone();
             let partial_schema = partial_schema.clone();

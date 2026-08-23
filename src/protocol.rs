@@ -3,9 +3,13 @@
 //! The local runner does not send these messages yet. They define stable, validated ownership
 //! boundaries for the future RPC layer without coupling protocol types to a specific transport.
 
+use crate::catalog::Catalog;
+use crate::execution::PhysicalPlan;
+use crate::plan_codec::PhysicalPlanCodec;
 use crate::{Result, SparkXError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -63,11 +67,34 @@ pub struct StagePlan {
     pub stage_id: StageId,
     pub input_stages: Vec<StageId>,
     pub partition_count: u32,
-    /// Opaque bytes owned by the future versioned physical-plan codec.
+    /// Versioned Protobuf bytes produced by [`PhysicalPlanCodec`].
     pub plan_fragment: Vec<u8>,
 }
 
 impl StagePlan {
+    pub fn from_physical_plan(
+        query_id: QueryId,
+        stage_id: StageId,
+        input_stages: Vec<StageId>,
+        partition_count: u32,
+        plan: &PhysicalPlan,
+    ) -> Result<Self> {
+        let stage = Self {
+            query_id,
+            stage_id,
+            input_stages,
+            partition_count,
+            plan_fragment: PhysicalPlanCodec::encode(plan)?,
+        };
+        stage.validate()?;
+        Ok(stage)
+    }
+
+    pub fn decode_physical_plan(&self, catalog: &Catalog) -> Result<Arc<PhysicalPlan>> {
+        self.validate()?;
+        PhysicalPlanCodec::decode(&self.plan_fragment, catalog)
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.query_id.validate()?;
         if self.partition_count == 0 {
@@ -75,9 +102,7 @@ impl StagePlan {
                 "stage partition count must be greater than zero",
             ));
         }
-        if self.plan_fragment.is_empty() {
-            return Err(protocol_error("stage plan fragment must not be empty"));
-        }
+        PhysicalPlanCodec::validate_fragment(&self.plan_fragment)?;
         let mut dependencies = BTreeSet::new();
         for dependency in &self.input_stages {
             if dependency == &self.stage_id {

@@ -15,6 +15,7 @@ pub mod logical;
 pub mod memory;
 pub mod metrics;
 pub mod optimizer;
+pub mod plan_codec;
 pub mod planner;
 pub mod protocol;
 mod pruning;

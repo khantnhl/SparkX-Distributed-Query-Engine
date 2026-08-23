@@ -1,18 +1,37 @@
+use arrow::datatypes::{DataType, Field, Schema};
 use sparkx::SparkXError;
+use sparkx::catalog::MemoryTable;
+use sparkx::execution::PhysicalPlan;
 use sparkx::protocol::{
     CoordinatorMessage, PROTOCOL_VERSION, PartitionId, QueryId, ShuffleBlock, ShuffleLocation,
     StageId, StagePlan, TaskAttemptId, TaskLease, TaskState, WorkerHeartbeat, WorkerId,
     WorkerMessage, WorkerRegistration,
 };
+use std::sync::Arc;
 
 fn stage() -> StagePlan {
-    StagePlan {
-        query_id: QueryId::new("query-42").unwrap(),
-        stage_id: StageId(2),
-        input_stages: vec![StageId(1)],
-        partition_count: 4,
-        plan_fragment: vec![1, 2, 3],
-    }
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let provider = Arc::new(MemoryTable::new(schema.clone(), vec![Vec::new()]).unwrap());
+    let plan = PhysicalPlan::Scan {
+        id: 0,
+        table_name: "input".to_owned(),
+        provider,
+        projection: None,
+        filters: Vec::new(),
+        schema,
+    };
+    StagePlan::from_physical_plan(
+        QueryId::new("query-42").unwrap(),
+        StageId(2),
+        vec![StageId(1)],
+        4,
+        &plan,
+    )
+    .unwrap()
 }
 
 fn task() -> TaskAttemptId {
@@ -58,6 +77,13 @@ fn rejects_inconsistent_stage_task_and_lease_contracts() {
     recursive_stage.input_stages.push(recursive_stage.stage_id);
     assert!(matches!(
         recursive_stage.validate(),
+        Err(SparkXError::Protocol(_))
+    ));
+
+    let mut corrupt_fragment = stage();
+    corrupt_fragment.plan_fragment = vec![1, 2, 3];
+    assert!(matches!(
+        corrupt_fragment.validate(),
         Err(SparkXError::Protocol(_))
     ));
 

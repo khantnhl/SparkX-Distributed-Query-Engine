@@ -79,8 +79,9 @@ Exit criterion: the optimizer chooses explainable plans and improves a represent
 Foundation: versioned Serde contracts now cover stage fragments, worker registration and
 heartbeats, task attempts and leases, cancellation, task states, and immutable shuffle-block
 metadata. Distributed partial batches now cross a query-scoped loopback Arrow Flight/gRPC
-transport. A physical-plan codec, control-plane transport, coordinator state machine, and remote
-execution remain open.
+transport. Versioned Protobuf fragments now encode every current physical operator and expression;
+workers resolve scans through their catalog and validate the embedded Arrow contract before running.
+Control-plane transport, a coordinator state machine, and remote execution remain open.
 
 Split the current `LocalCluster` seam into:
 
@@ -98,7 +99,7 @@ flowchart LR
 
 Implement:
 
-- Protobuf plan fragments and Arrow Flight/gRPC batch transport
+- Protobuf plan fragments and Arrow Flight/gRPC batch transport (implemented in the local-cluster path)
 - Worker registration, resources, heartbeat, leases, and task attempts
 - Exchange partitioning, backpressure, checksums, and durable/recomputable blocks
 - Query cancellation and deadlines propagated to every task

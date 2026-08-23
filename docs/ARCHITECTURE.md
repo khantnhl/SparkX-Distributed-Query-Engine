@@ -157,7 +157,7 @@ hash paths.
 
 ### 6. Local distributed execution
 
-The cluster path is used when a physical plan ends in a hash aggregate over a multi-partition, non-join input.
+The cluster path is used when a physical plan ends in a hash aggregate over a multi-partition, non-join input. Before tasks start, the worker input is encoded as a versioned Protobuf fragment and decoded through the worker catalog. This removes reliance on sharing the coordinator's in-memory plan object, even though the workers still run in the same process.
 
 ```mermaid
 flowchart TB
@@ -186,8 +186,16 @@ Each partial batch is Arrow-encoded by a Flight client, sent through gRPC to a q
 The transport-neutral contracts in `protocol.rs` define versioned coordinator assignments and
 worker registration, heartbeat, task-state, lease, cancellation, and immutable shuffle-block
 messages. IDs and cross-message ownership are validated before use, and the contracts round-trip
-through Serde. `StagePlan.plan_fragment` is deliberately opaque until a physical-plan codec lands.
-These control-plane types are not wired into `LocalCluster`. The existing Flight service carries only Arrow shuffle batches; it does not yet register workers, assign tasks, or serialize physical plans.
+through Serde. `StagePlan.plan_fragment` contains a versioned Protobuf physical plan supporting every
+current physical operator and expression. Fragments are bounded to 16 MiB and 128 plan levels,
+reject malformed or unsupported values, and carry explicit Arrow field contracts. Scan nodes contain
+the catalog table name instead of a serialized `TableProvider`; decoding resolves that provider in the
+worker catalog and rejects schema drift before execution.
+
+`LocalCluster` now executes its worker input from this decoded fragment, so local-distributed tests
+exercise the same serialization boundary required by a remote worker. The remaining control-plane
+types are not yet wired into a service: Flight carries Arrow shuffle batches, but it does not register
+workers or assign tasks over RPC.
 
 ### 7. Observability and query result
 
@@ -242,7 +250,7 @@ flowchart LR
     end
 ```
 
-The data-plane transport seam now exists inside `LocalCluster`. The next step is to fragment and serialize physical plans, move task execution behind worker RPC handlers, and connect the existing coordinator/worker contracts to a control-plane service.
+The data-plane transport and physical-plan serialization seams now exist inside `LocalCluster`. The next step is to move task execution behind worker RPC handlers and connect the existing coordinator/worker contracts to a control-plane service.
 
 ## Non-goals for version 0.1
 

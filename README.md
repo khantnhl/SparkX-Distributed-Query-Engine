@@ -1,6 +1,6 @@
 # SparkX Distributed Query Engine
 
-SparkX is a scrappy, inspectable query-engine prototype written in Rust. It owns the full path from SQL text to Arrow record batches: catalog lookup, logical planning, rule-based optimization, physical planning, bounded asynchronous execution, hash aggregation/joining, metrics, and a two-stage in-process distributed aggregate runner with a loopback Arrow Flight exchange.
+SparkX is a scrappy, inspectable query-engine prototype written in Rust. It owns the full path from SQL text to Arrow record batches: catalog lookup, logical planning, rule-based optimization, physical planning, bounded asynchronous execution, hash aggregation/joining, metrics, and a two-stage in-process distributed aggregate runner with Protobuf plan fragments and a loopback Arrow Flight exchange.
 
 It is deliberately smaller than production systems such as Daft, DataFusion, Spark, or DuckDB. The goal is to make the important engine boundaries real and runnable without hiding them behind a framework.
 
@@ -21,6 +21,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Bounded Tokio channels for backpressure between streaming operators
 - Concurrent partition scans and a worker-limited local cluster
 - Two-stage partial/final distributed aggregation over a loopback Arrow Flight/gRPC exchange
+- Versioned Protobuf physical-plan fragments with worker-side catalog and schema validation
 - Versioned, serializable coordinator/worker protocol contracts
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing/pruning metrics, and cooperative query cancellation
@@ -71,6 +72,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/logical.rs` | Typed logical plan and plan display |
 | `src/optimizer.rs` | Rule-based filter/projection pushdown |
 | `src/planner.rs` | Logical-to-physical lowering |
+| `src/plan_codec.rs` | Versioned Protobuf physical-plan fragment codec |
 | `src/protocol.rs` | Validated coordinator/worker wire contracts |
 | `src/execution.rs` | Async operators, vectorized execution, joins, sorts, aggregates |
 | `src/distributed.rs` | Local scheduler, partial aggregation, Flight exchange and merge |
@@ -89,7 +91,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation still runs inside one process, but partial batches now cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. It exercises scheduling, partition tasks, partial aggregation, transport encoding/decoding, exchange accounting, and final aggregation. Serializable messages define future worker registration, heartbeat, lease, task-attempt, cancellation, and shuffle-block boundaries, but that control protocol and physical plans are not wired to remote workers yet; remote object storage, retries, and durable shuffle are still absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The “distributed” implementation still runs inside one process, but worker inputs are serialized as versioned Protobuf physical-plan fragments and partial batches cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. It exercises plan decoding through a worker catalog, scheduling, partition tasks, partial aggregation, transport encoding/decoding, exchange accounting, and final aggregation. Serializable messages define future worker registration, heartbeat, lease, task-attempt, cancellation, and shuffle-block boundaries, but task assignment is not wired to a remote control-plane service yet; remote object storage, retries, and durable shuffle are still absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

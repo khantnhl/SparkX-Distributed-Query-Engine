@@ -65,7 +65,9 @@ null. The optimized plan text exposes these rewrites.
 The current local-cluster runner uses two-stage execution only for a non-distinct top-level hash
 aggregate over a join-free input with more than one scan partition. Other query shapes execute
 natively and report `distributed = false` rather than pretending to be distributed. Eligible
-partial batches cross a query-scoped loopback Arrow Flight/gRPC exchange before the final merge.
+worker inputs round-trip through a versioned Protobuf physical-plan fragment and resolve scans from
+the worker catalog. Their partial batches then cross a query-scoped loopback Arrow Flight/gRPC
+exchange before the final merge.
 
 CSV files expose one partition. Memory tables can contain multiple explicit partitions, and each
 Parquet row group is a partition.
