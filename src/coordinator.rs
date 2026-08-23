@@ -72,6 +72,7 @@ pub enum StageStatus {
 pub enum PartitionStatus {
     Pending { next_attempt: u32 },
     Running { attempt: u32 },
+    Cancelling { attempt: u32 },
     Succeeded { attempt: u32 },
     Failed { attempt: u32, error: String },
     Cancelled,
@@ -113,6 +114,11 @@ enum PartitionRuntime {
         worker_id: WorkerId,
         lease: TaskLease,
         started_at_ms: Option<u64>,
+    },
+    Cancelling {
+        task: TaskAttemptId,
+        worker_id: WorkerId,
+        lease: TaskLease,
     },
     Succeeded {
         task: TaskAttemptId,
@@ -357,26 +363,26 @@ impl Coordinator {
             )));
         }
 
-        let active_workers = self
-            .stages
-            .iter()
-            .filter(|((stage_query_id, _), _)| stage_query_id == &query_id)
-            .flat_map(|(_, stage)| stage.partitions.iter())
-            .filter_map(|partition| match partition {
-                PartitionRuntime::Active { worker_id, .. } => Some(worker_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for worker_id in active_workers {
-            self.release_worker_slot(&worker_id);
-        }
         for ((stage_query_id, _), stage) in &mut self.stages {
             if stage_query_id != &query_id {
                 continue;
             }
             for partition in &mut stage.partitions {
-                if !matches!(partition, PartitionRuntime::Succeeded { .. }) {
-                    *partition = PartitionRuntime::Cancelled;
+                match partition {
+                    PartitionRuntime::Active {
+                        task,
+                        worker_id,
+                        lease,
+                        ..
+                    } => {
+                        *partition = PartitionRuntime::Cancelling {
+                            task: task.clone(),
+                            worker_id: worker_id.clone(),
+                            lease: lease.clone(),
+                        };
+                    }
+                    PartitionRuntime::Succeeded { .. } => {}
+                    _ => *partition = PartitionRuntime::Cancelled,
                 }
             }
         }
@@ -408,14 +414,19 @@ impl Coordinator {
         let mut expired = Vec::new();
         for (stage_key, stage) in &self.stages {
             for (partition_index, partition) in stage.partitions.iter().enumerate() {
-                let PartitionRuntime::Active {
-                    task,
-                    worker_id,
-                    lease,
-                    ..
-                } = partition
-                else {
-                    continue;
+                let (task, worker_id, lease, cancelling) = match partition {
+                    PartitionRuntime::Active {
+                        task,
+                        worker_id,
+                        lease,
+                        ..
+                    } => (task, worker_id, lease, false),
+                    PartitionRuntime::Cancelling {
+                        task,
+                        worker_id,
+                        lease,
+                    } => (task, worker_id, lease, true),
+                    _ => continue,
                 };
                 let worker_timed_out = timed_out_workers.contains(worker_id);
                 if worker_timed_out || lease.expires_at_ms <= now_ms {
@@ -425,24 +436,31 @@ impl Coordinator {
                         task.attempt,
                         worker_id.clone(),
                         worker_timed_out,
+                        cancelling,
                     ));
                 }
             }
         }
 
-        for (stage_key, partition_index, attempt, worker_id, worker_timed_out) in expired {
+        for (stage_key, partition_index, attempt, worker_id, worker_timed_out, cancelling) in
+            expired
+        {
             if !worker_timed_out {
                 self.release_worker_slot(&worker_id);
             }
-            let replacement = retry_or_fail(
-                self.config.max_task_attempts,
-                attempt,
-                if worker_timed_out {
-                    "worker heartbeat timed out"
-                } else {
-                    "task lease expired"
-                },
-            );
+            let replacement = if cancelling {
+                PartitionRuntime::Cancelled
+            } else {
+                retry_or_fail(
+                    self.config.max_task_attempts,
+                    attempt,
+                    if worker_timed_out {
+                        "worker heartbeat timed out"
+                    } else {
+                        "task lease expired"
+                    },
+                )
+            };
             self.stages
                 .get_mut(&stage_key)
                 .expect("expired task stage must exist")
@@ -514,6 +532,9 @@ impl Coordinator {
                 next_attempt: *next_attempt,
             },
             PartitionRuntime::Active { task, .. } => PartitionStatus::Running {
+                attempt: task.attempt,
+            },
+            PartitionRuntime::Cancelling { task, .. } => PartitionStatus::Cancelling {
                 attempt: task.attempt,
             },
             PartitionRuntime::Succeeded { task, .. } => PartitionStatus::Succeeded {
@@ -646,6 +667,32 @@ impl Coordinator {
                 task.partition_id.0
             ))
         })?;
+        if let PartitionRuntime::Cancelling {
+            task: active_task,
+            worker_id: assigned_worker,
+            lease,
+        } = partition
+        {
+            if active_task != &task {
+                return Err(coordinator_error(
+                    "task update does not match the cancelling attempt",
+                ));
+            }
+            if assigned_worker != &worker_id || lease.worker_id != worker_id {
+                return Err(coordinator_error(
+                    "task cancellation came from a worker that does not own its lease",
+                ));
+            }
+            let TaskState::Cancelled { finished_at_ms, .. } = state else {
+                return Err(coordinator_error(
+                    "a cancelling task only accepts a cancelled terminal update",
+                ));
+            };
+            validate_reported_time("finished", finished_at_ms, lease, received_at_ms)?;
+            *partition = PartitionRuntime::Cancelled;
+            self.release_worker_slot(&worker_id);
+            return Ok(());
+        }
         let PartitionRuntime::Active {
             task: active_task,
             worker_id: assigned_worker,
@@ -767,6 +814,9 @@ impl Coordinator {
                 matches!(
                     partition,
                     PartitionRuntime::Active {
+                        worker_id: assigned_worker,
+                        ..
+                    } | PartitionRuntime::Cancelling {
                         worker_id: assigned_worker,
                         ..
                     } if assigned_worker == worker_id

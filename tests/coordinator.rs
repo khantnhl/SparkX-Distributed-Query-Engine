@@ -403,7 +403,7 @@ fn records_successful_blocks_and_cancels_active_queries() {
     let mut cancelled = coordinator(100, 50, 3);
     cancelled.submit_stage(stage(0, Vec::new(), 2)).unwrap();
     register(&mut cancelled, "worker-a", 1, 0);
-    assignment(&mut cancelled, 1);
+    let (_, cancelled_task, cancelled_worker) = assignment(&mut cancelled, 1);
     let cancel = cancelled
         .cancel_query(query_id(), "user requested cancellation")
         .unwrap();
@@ -416,13 +416,37 @@ fn records_successful_blocks_and_cancels_active_queries() {
         cancelled
             .partition_status(&query_id(), StageId(0), PartitionId(0))
             .unwrap(),
+        PartitionStatus::Cancelling { attempt: 0 }
+    );
+    assert_eq!(
+        cancelled.worker_available_slots(&WorkerId::new("worker-a").unwrap()),
+        Some(0)
+    );
+    assert!(cancelled.next_assignment(2).unwrap().is_none());
+    cancelled
+        .handle_worker_message(
+            WorkerMessage::TaskUpdate {
+                version: PROTOCOL_VERSION,
+                worker_id: WorkerId::new(cancelled_worker).unwrap(),
+                task: cancelled_task,
+                state: TaskState::Cancelled {
+                    finished_at_ms: 2,
+                    reason: "worker stopped cancelled task".to_owned(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        cancelled
+            .partition_status(&query_id(), StageId(0), PartitionId(0))
+            .unwrap(),
         PartitionStatus::Cancelled
     );
     assert_eq!(
         cancelled.worker_available_slots(&WorkerId::new("worker-a").unwrap()),
         Some(1)
     );
-    assert!(cancelled.next_assignment(2).unwrap().is_none());
     cancelled
         .cancel_query(query_id(), "user requested cancellation")
         .unwrap();

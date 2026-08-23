@@ -151,11 +151,15 @@ async fn flight_control_plane_runs_worker_and_query_lifecycle() {
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        cancelled_assignment,
-        CoordinatorMessage::AssignTask { ref task, .. }
-            if task.query_id == cancelled_query
-    ));
+    let CoordinatorMessage::AssignTask {
+        task: cancelled_task,
+        lease: cancelled_lease,
+        ..
+    } = cancelled_assignment
+    else {
+        panic!("expected task assignment");
+    };
+    assert_eq!(cancelled_task.query_id, cancelled_query);
     let cancellation = client
         .cancel_query(cancelled_query.clone(), "test cancellation")
         .await
@@ -176,8 +180,28 @@ async fn flight_control_plane_runs_worker_and_query_lifecycle() {
             .unwrap(),
         StageStatus::Cancelled
     );
-    let worker_cancellation = client.poll_assignment(worker_id).await.unwrap().unwrap();
+    let worker_cancellation = client
+        .poll_assignment(worker_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(worker_cancellation, cancellation);
+    client
+        .send_worker_message(WorkerMessage::TaskUpdate {
+            version: PROTOCOL_VERSION,
+            worker_id: worker_id.clone(),
+            task: cancelled_task,
+            state: TaskState::Cancelled {
+                finished_at_ms: cancelled_lease.issued_at_ms,
+                reason: "worker received cancellation".to_owned(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.lock().await.worker_available_slots(&worker_id),
+        Some(1)
+    );
 
     server.close().await.unwrap();
 }

@@ -205,7 +205,9 @@ which keeps the state machine deterministic in tests.
 accepts stage submissions, worker lifecycle messages, worker-specific assignment polls, task updates,
 and query cancellation. Requests and responses are bounded to 96 MiB, validated before mutation, and
 mapped to explicit gRPC status codes. Cancelling a query queues a control message for every worker
-holding one of its leases, and polling returns those messages before new assignments.
+holding one of its leases, and polling returns those messages before new assignments. The coordinator
+retains each cancelling lease and worker slot until the worker acknowledges cancellation or the
+lease/heartbeat expires, preventing new work from overbooking a worker that is still stopping.
 
 The local query runner does not connect through this service yet; its task handlers remain Tokio
 closures in the same process. The control service has no standalone executable, authentication, or TLS,
