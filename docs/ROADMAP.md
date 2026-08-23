@@ -90,7 +90,9 @@ runtime now executes leased plan fragments against its own catalog, heartbeats d
 work, and acknowledges cancellation. A standalone coordinator executable hosts the same state and
 control service with configurable deadlines and limits. Remote workers now retain bounded Arrow output
 behind Flight `DoPut`/`DoGet`, report owner/endpoint/ticket/checksum manifests, and support verified
-download and explicit deletion. Session-level remote graph submission, repartitioned exchange, and
+download and explicit deletion. A driver-side runner now submits one pre-fragmented stage, observes
+stage/partition status, propagates timeout/cancellation, and collects verified output. Session-level
+remote graph fragmentation/merge, repartitioned exchange, and
 durable shuffle remain open.
 
 Split the current `LocalCluster` seam into:

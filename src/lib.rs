@@ -22,6 +22,7 @@ pub mod plan_codec;
 pub mod planner;
 pub mod protocol;
 mod pruning;
+pub mod remote;
 mod row_key;
 pub mod session;
 pub mod worker;

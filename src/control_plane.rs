@@ -1,6 +1,6 @@
 //! Arrow Flight/gRPC transport for coordinator and worker control messages.
 
-use crate::coordinator::Coordinator;
+use crate::coordinator::{Coordinator, PartitionStatus, StageStatus};
 use crate::protocol::{
     CoordinatorMessage, PROTOCOL_VERSION, QueryId, ShuffleBlock, StageId, StagePlan,
     WorkerHeartbeat, WorkerId, WorkerMessage, WorkerRegistration,
@@ -33,6 +33,8 @@ const ACTION_WORKER_MESSAGE: &str = "sparkx.control.worker_message";
 const ACTION_POLL_ASSIGNMENT: &str = "sparkx.control.poll_assignment";
 const ACTION_CANCEL_QUERY: &str = "sparkx.control.cancel_query";
 const ACTION_STAGE_OUTPUT_BLOCKS: &str = "sparkx.control.stage_output_blocks";
+const ACTION_STAGE_STATUS: &str = "sparkx.control.stage_status";
+const ACTION_PARTITION_STATUS: &str = "sparkx.control.partition_status";
 
 /// Upper bound for one control request or response, including JSON expansion of plan bytes.
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 96 * 1024 * 1024;
@@ -59,6 +61,13 @@ struct CancelQueryRequest {
 struct StageOutputBlocksRequest {
     query_id: QueryId,
     stage_id: StageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PartitionStatusRequest {
+    query_id: QueryId,
+    stage_id: StageId,
+    partition_id: crate::protocol::PartitionId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +242,35 @@ impl ControlPlaneClient {
         self.call(
             ACTION_STAGE_OUTPUT_BLOCKS,
             &StageOutputBlocksRequest { query_id, stage_id },
+        )
+        .await
+    }
+
+    pub async fn stage_status(
+        &mut self,
+        query_id: QueryId,
+        stage_id: StageId,
+    ) -> Result<StageStatus> {
+        self.call(
+            ACTION_STAGE_STATUS,
+            &StageOutputBlocksRequest { query_id, stage_id },
+        )
+        .await
+    }
+
+    pub async fn partition_status(
+        &mut self,
+        query_id: QueryId,
+        stage_id: StageId,
+        partition_id: crate::protocol::PartitionId,
+    ) -> Result<PartitionStatus> {
+        self.call(
+            ACTION_PARTITION_STATUS,
+            &PartitionStatusRequest {
+                query_id,
+                stage_id,
+                partition_id,
+            },
         )
         .await
     }
@@ -443,6 +481,28 @@ impl FlightService for ControlPlaneFlightService {
                     .map_err(map_status)?;
                 encode_response(&blocks)?
             }
+            ACTION_STAGE_STATUS => {
+                let request: StageOutputBlocksRequest =
+                    decode_request(&action.body, ACTION_STAGE_STATUS)?;
+                let status = self
+                    .coordinator
+                    .lock()
+                    .await
+                    .stage_status(&request.query_id, request.stage_id)
+                    .map_err(map_status)?;
+                encode_response(&status)?
+            }
+            ACTION_PARTITION_STATUS => {
+                let request: PartitionStatusRequest =
+                    decode_request(&action.body, ACTION_PARTITION_STATUS)?;
+                let status = self
+                    .coordinator
+                    .lock()
+                    .await
+                    .partition_status(&request.query_id, request.stage_id, request.partition_id)
+                    .map_err(map_status)?;
+                encode_response(&status)?
+            }
             other => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported SparkX control action {other}"
@@ -478,6 +538,11 @@ impl FlightService for ControlPlaneFlightService {
             (
                 ACTION_STAGE_OUTPUT_BLOCKS,
                 "Read the output manifests for a successful stage",
+            ),
+            (ACTION_STAGE_STATUS, "Read one stage's lifecycle status"),
+            (
+                ACTION_PARTITION_STATUS,
+                "Read one partition's lifecycle status",
             ),
         ]
         .into_iter()

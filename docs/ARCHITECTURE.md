@@ -203,7 +203,7 @@ which keeps the state machine deterministic in tests.
 
 `control_plane.rs` hosts the state machine behind typed Arrow Flight `DoAction` calls. The service
 accepts stage submissions, worker lifecycle messages, worker-specific assignment polls, task updates,
-query cancellation, and successful-stage output-manifest reads. Requests and responses are bounded to
+query cancellation, stage/partition status reads, and successful-stage output-manifest reads. Requests and responses are bounded to
 96 MiB, validated before mutation, and
 mapped to explicit gRPC status codes. Cancelling a query queues a control message for every worker
 holding one of its leases, and polling returns those messages before new assignments. The coordinator
@@ -224,6 +224,12 @@ through the control client, fetch batches with `DoGet`, verify their metadata/ch
 delete consumed blocks. The store accounts retained Arrow bytes against a fixed capacity, rejects an
 oversized streaming upload while decoding it, and preserves schemas for empty results. It is an
 in-memory, worker-lifetime result sink—not durable shuffle—and currently has no authentication or TLS.
+
+`RemoteStageRunner` is the first driver-side consumer of these services. It submits one prebuilt
+`StagePlan`, polls explicit stage status, expands terminal failures with per-partition attempt errors,
+propagates cancellation and timeout to the coordinator, downloads every output block, verifies a
+consistent Arrow schema, and only then performs best-effort deletion. It deliberately does not claim
+to fragment or merge an arbitrary SQL physical plan; that remains the `Session` integration step.
 
 `sparkx-coordinator` hosts the same state and Flight service in a standalone process with configurable
 bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. The local
@@ -287,8 +293,8 @@ flowchart LR
 ```
 
 Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
-processes, and a bounded worker-hosted Flight output sink now exist. The next step is to make the
-`Session` driver submit remote stage graphs, consume their manifests, and repartition intermediate
+processes, a bounded worker-hosted Flight output sink, and a single-stage remote driver now exist. The
+next step is to make `Session` fragment and submit remote stage graphs, merge their manifests, and repartition intermediate
 blocks; durable/object-store shuffle follows that integration.
 
 ## Non-goals for version 0.1

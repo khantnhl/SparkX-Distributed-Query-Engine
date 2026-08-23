@@ -204,6 +204,12 @@ pub struct FlightDataPlaneClient {
     client: FlightClient<Channel>,
 }
 
+#[derive(Debug)]
+pub struct DownloadedBlock {
+    pub schema: SchemaRef,
+    pub batches: Vec<RecordBatch>,
+}
+
 impl FlightDataPlaneClient {
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
@@ -282,6 +288,10 @@ impl FlightDataPlaneClient {
     }
 
     pub async fn download(&mut self, block: &ShuffleBlock) -> Result<Vec<RecordBatch>> {
+        Ok(self.download_with_schema(block).await?.batches)
+    }
+
+    pub async fn download_with_schema(&mut self, block: &ShuffleBlock) -> Result<DownloadedBlock> {
         let (endpoint, ticket) = match &block.location {
             ShuffleLocation::Flight {
                 endpoint, ticket, ..
@@ -318,7 +328,7 @@ impl FlightDataPlaneClient {
                 block.rows, block.bytes, block.checksum
             )));
         }
-        Ok(batches)
+        Ok(DownloadedBlock { schema, batches })
     }
 
     pub async fn delete(&mut self, block: &ShuffleBlock) -> Result<()> {
