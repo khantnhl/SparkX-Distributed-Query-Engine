@@ -1,6 +1,9 @@
 use clap::{Parser, ValueEnum};
-use sparkx::{Result, Session, SessionConfig, SparkXError};
+use sparkx::protocol::QueryId;
+use sparkx::remote::RemoteStageConfig;
+use sparkx::{CancellationToken, Result, Session, SessionConfig, SparkXError};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum InputFormat {
@@ -39,6 +42,22 @@ struct Args {
     /// Enable the in-process distributed runner.
     #[arg(long)]
     distributed: bool,
+
+    /// Execute eligible partition-local SQL through a standalone coordinator and workers.
+    #[arg(long, conflicts_with = "distributed")]
+    remote_coordinator: Option<String>,
+
+    /// Query ID used by the remote coordinator. Generated when omitted.
+    #[arg(long, requires = "remote_coordinator")]
+    remote_query_id: Option<String>,
+
+    /// Maximum remote stage runtime in milliseconds.
+    #[arg(long, default_value_t = 300_000, requires = "remote_coordinator")]
+    remote_timeout_ms: u64,
+
+    /// Retain verified remote output blocks instead of deleting them after collection.
+    #[arg(long, requires = "remote_coordinator")]
+    keep_remote_output: bool,
 
     /// Number of local cluster workers.
     #[arg(long, default_value_t = num_cpus::get().max(1))]
@@ -111,8 +130,32 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let result = session.execute_sql(&args.sql).await?;
+    let remote_execution = args.remote_coordinator.is_some();
+    let result = if let Some(endpoint) = &args.remote_coordinator {
+        let mut remote = RemoteStageConfig::new(endpoint.clone());
+        remote.timeout = Duration::from_millis(args.remote_timeout_ms);
+        remote.delete_output_after_fetch = !args.keep_remote_output;
+        let query_id = match &args.remote_query_id {
+            Some(query_id) => QueryId::new(query_id.clone())?,
+            None => generated_query_id()?,
+        };
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal.cancel();
+            }
+        });
+        session
+            .execute_sql_remote_with_cancellation(&args.sql, query_id, remote, cancellation)
+            .await?
+    } else {
+        session.execute_sql(&args.sql).await?
+    };
     println!("{}", result.pretty()?);
+    for error in &result.cleanup_errors {
+        eprintln!("warning: remote output cleanup failed: {error}");
+    }
     if args.show_plan {
         println!("\n== Optimized Logical Plan ==\n{}", result.optimized_plan);
         println!("== Physical Plan ==\n{}", result.physical_plan);
@@ -125,7 +168,9 @@ async fn run() -> Result<()> {
         );
         println!(
             "runner: {} ({} stage{})",
-            if result.distributed {
+            if remote_execution {
+                "remote-flight"
+            } else if result.distributed {
                 "local-flight"
             } else {
                 "native"
@@ -135,4 +180,12 @@ async fn run() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn generated_query_id() -> Result<QueryId> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| SparkXError::execution(format!("read system clock: {error}")))?
+        .as_millis();
+    QueryId::new(format!("cli-{}-{timestamp}", std::process::id()))
 }

@@ -92,7 +92,8 @@ control service with configurable deadlines and limits. Remote workers now retai
 behind Flight `DoPut`/`DoGet`, report owner/endpoint/ticket/checksum manifests, and support verified
 download and explicit deletion. A driver-side runner now submits one pre-fragmented stage, observes
 stage/partition status, propagates timeout/cancellation, and collects verified output. Session-level
-remote graph fragmentation/merge, repartitioned exchange, and
+partition-local scan/filter/projection SQL now uses that runner and rejects global shapes before
+submission. Remote graph fragmentation/merge, repartitioned exchange, and
 durable shuffle remain open.
 
 Split the current `LocalCluster` seam into:

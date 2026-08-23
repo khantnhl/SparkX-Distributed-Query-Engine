@@ -29,6 +29,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Standalone `sparkx-coordinator` service with configurable leases, retries, and heartbeat expiry
 - Bounded worker-hosted Flight output blocks with ownership, tickets, checksums, and deletion
 - Remote stage runner with status/failure polling, timeout/cancellation, verified fetch, and cleanup
+- `Session` and CLI execution of partition-local SQL on standalone coordinator/worker processes
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing/pruning metrics, and cooperative query cancellation
 - Query-scoped memory reservations with a configurable limit and peak-memory metric
@@ -70,12 +71,24 @@ cargo run --bin sparkx-worker -- \
   --coordinator http://127.0.0.1:50051 \
   --worker-id worker-1 \
   --table sales=./sales.parquet
+
+# Terminal 3
+cargo run --bin sparkx -- \
+  --input ./sales.parquet \
+  --table sales \
+  --sql "SELECT region, amount FROM sales WHERE amount > 10" \
+  --remote-coordinator http://127.0.0.1:50051 \
+  --metrics
 ```
 
 The worker serves task output from an ephemeral loopback data port by default. For another machine
 to fetch it, bind a reachable interface with `--data-bind 0.0.0.0:50052` and publish that machine's
 DNS name or IP with `--data-advertised-host`. Output is bounded by `--data-storage-bytes` and remains
 available until the consumer deletes it or the worker exits.
+
+Remote SQL currently accepts only partition-local `Scan`, `Filter`, and `Projection` plans. Global
+aggregates, joins, sorts, and limits fail during planning instead of producing partition-local answers.
+The planning process and every worker must register the same table name with a compatible schema.
 
 ## Developer workflow
 
@@ -126,9 +139,9 @@ The local-cluster query runner still executes its logical workers inside one pro
 `sparkx-coordinator` and `sparkx-worker` executables now run the control and execution paths as separate
 processes. Workers publish successful task batches to bounded, worker-hosted Flight storage and report
 owner/endpoint/ticket/checksum manifests; the control client can read those manifests and a data client
-can download, verify, and delete each block. The main `Session` query driver does not yet submit a whole
-remote stage graph or merge those manifests into a `QueryResult`; the library-level `RemoteStageRunner`
-currently operates on one already-fragmented `StagePlan`. Output storage is memory-only and tied
+can download, verify, and delete each block. `Session` and the main CLI use that path for one
+partition-local stage, but do not yet fragment global operators into a whole remote stage graph. The
+library-level `RemoteStageRunner` operates on one already-fragmented `StagePlan`. Output storage is memory-only and tied
 to worker lifetime, and authentication, TLS, durable/object-store shuffle, coordinator recovery, and
 production retry commits are absent. Blocking operators enforce a query memory limit but still fail rather
 than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.

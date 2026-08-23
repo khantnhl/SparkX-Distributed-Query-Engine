@@ -9,6 +9,8 @@ use crate::memory::{DEFAULT_MEMORY_LIMIT_BYTES, QueryMemory};
 use crate::metrics::{MetricsSnapshot, QueryMetrics};
 use crate::optimizer::Optimizer;
 use crate::planner::PhysicalPlanner;
+use crate::protocol::{QueryId, StageId, StagePlan};
+use crate::remote::{RemoteStageConfig, RemoteStageRunner};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast::{
@@ -53,6 +55,7 @@ pub struct QueryResult {
     pub physical_plan: String,
     pub distributed: bool,
     pub stages: usize,
+    pub cleanup_errors: Vec<String>,
 }
 
 impl QueryResult {
@@ -161,6 +164,64 @@ impl Session {
             .await
     }
 
+    pub async fn execute_sql_remote(
+        &self,
+        sql: &str,
+        query_id: QueryId,
+        remote: RemoteStageConfig,
+    ) -> Result<QueryResult> {
+        self.execute_sql_remote_with_cancellation(sql, query_id, remote, CancellationToken::new())
+            .await
+    }
+
+    pub async fn execute_sql_remote_with_cancellation(
+        &self,
+        sql: &str,
+        query_id: QueryId,
+        remote: RemoteStageConfig,
+        cancellation: CancellationToken,
+    ) -> Result<QueryResult> {
+        cancellation.check()?;
+        let logical = self.sql(sql)?;
+        let logical_text = logical.explain();
+        let optimized = self.optimizer.optimize(logical)?;
+        let optimized_text = optimized.explain();
+        let physical = PhysicalPlanner::create_physical_plan(&optimized, &self.catalog)?;
+        let physical_text = physical.explain();
+        let partition_count = remote_partition_count(physical.as_ref())?;
+        let stage = StagePlan::from_physical_plan(
+            query_id,
+            StageId(0),
+            Vec::new(),
+            partition_count,
+            physical.as_ref(),
+        )?;
+        let metrics = QueryMetrics::default();
+        let started = Instant::now();
+        let result = RemoteStageRunner::new(remote)?
+            .execute(stage, cancellation)
+            .await?;
+        for batch in &result.batches {
+            metrics.record_output(batch.num_rows());
+        }
+        metrics.add_shuffled_rows(result.row_count());
+        metrics.add_shuffled_bytes(result.output_blocks.iter().map(|block| block.bytes).sum());
+        for _ in 0..partition_count {
+            metrics.add_task();
+        }
+        metrics.set_elapsed(started.elapsed());
+        Ok(QueryResult {
+            batches: result.batches,
+            metrics: metrics.snapshot(),
+            logical_plan: logical_text,
+            optimized_plan: optimized_text,
+            physical_plan: physical_text,
+            distributed: true,
+            stages: 1,
+            cleanup_errors: result.cleanup_errors,
+        })
+    }
+
     pub async fn execute_plan_with_cancellation(
         &self,
         logical: LogicalPlan,
@@ -204,6 +265,7 @@ impl Session {
             physical_plan: physical_text,
             distributed,
             stages,
+            cleanup_errors: Vec::new(),
         })
     }
 
@@ -513,6 +575,26 @@ impl Session {
             other => Err(SparkXError::unsupported(format!("SQL expression {other}"))),
         }
     }
+}
+
+fn remote_partition_count(plan: &crate::execution::PhysicalPlan) -> Result<u32> {
+    let partitions = match plan {
+        crate::execution::PhysicalPlan::Scan { provider, .. } => provider.partition_count(),
+        crate::execution::PhysicalPlan::Projection { input, .. }
+        | crate::execution::PhysicalPlan::Filter { input, .. } => {
+            return remote_partition_count(input.as_ref());
+        }
+        _ => {
+            return Err(SparkXError::unsupported(
+                "remote SQL currently supports only partition-local Scan, Filter, and Projection plans; aggregates, joins, sorts, and limits require multi-stage merge planning",
+            ));
+        }
+    };
+    u32::try_from(partitions).map_err(|_| {
+        SparkXError::planning(format!(
+            "remote scan has {partitions} partitions, which exceeds the protocol limit"
+        ))
+    })
 }
 
 fn qualify_schema(schema: &Schema, qualifier: &str) -> SchemaRef {

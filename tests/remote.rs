@@ -1,8 +1,6 @@
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use sparkx::CancellationToken;
-use sparkx::SparkXError;
 use sparkx::catalog::{Catalog, MemoryTable, TableRef};
 use sparkx::control_plane::ControlPlaneServer;
 use sparkx::coordinator::{Coordinator, CoordinatorConfig, StageStatus};
@@ -11,6 +9,7 @@ use sparkx::execution::PhysicalPlan;
 use sparkx::protocol::{QueryId, ShuffleLocation, StageId, StagePlan, WorkerId};
 use sparkx::remote::{RemoteStageConfig, RemoteStageRunner};
 use sparkx::worker::{RemoteWorker, WorkerConfig};
+use sparkx::{CancellationToken, Session, SessionConfig, SparkXError};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -231,4 +230,93 @@ async fn remote_stage_runner_cancels_work_after_timeout() {
         StageStatus::Cancelled
     );
     server.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_executes_partition_local_sql_on_remote_workers() {
+    let coordinator = Arc::new(Mutex::new(
+        Coordinator::new(CoordinatorConfig::default()).unwrap(),
+    ));
+    let server = ControlPlaneServer::start_loopback(coordinator)
+        .await
+        .unwrap();
+    let table = Arc::new(
+        MemoryTable::new(
+            batch(vec![1]).schema(),
+            vec![vec![batch(vec![1, 2])], vec![batch(vec![3, 4])]],
+        )
+        .unwrap(),
+    );
+    let worker_catalog = Arc::new(Catalog::default());
+    worker_catalog.register("input", table.clone());
+    let shutdown = CancellationToken::new();
+    let worker = RemoteWorker::new(
+        worker_config(server.endpoint(), "worker-session-sql", None),
+        worker_catalog,
+    )
+    .unwrap();
+    let worker_handle = tokio::spawn(worker.run_until(shutdown.clone()));
+    let session = Session::new(SessionConfig::default());
+    session.register_table("input", table);
+    let mut remote = RemoteStageConfig::new(server.endpoint());
+    remote.poll_interval = Duration::from_millis(5);
+    remote.timeout = Duration::from_secs(5);
+
+    let result = session
+        .execute_sql_remote(
+            "SELECT value + 10 AS shifted FROM input WHERE value > 1",
+            QueryId::new("query-session-sql").unwrap(),
+            remote,
+        )
+        .await
+        .unwrap();
+
+    let mut values = result
+        .batches
+        .iter()
+        .flat_map(|output| {
+            output
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(values, vec![12, 13, 14]);
+    assert!(result.distributed);
+    assert_eq!(result.stages, 1);
+    assert_eq!(result.metrics.tasks, 2);
+    assert_eq!(result.metrics.output_rows, 3);
+    assert!(result.cleanup_errors.is_empty());
+
+    shutdown.cancel();
+    worker_handle.await.unwrap().unwrap();
+    server.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_rejects_global_remote_sql_before_submission() {
+    let session = Session::new(SessionConfig::default());
+    session.register_memory(
+        "input",
+        MemoryTable::from_batches(vec![batch(vec![1, 2])], 1).unwrap(),
+    );
+
+    let error = session
+        .execute_sql_remote(
+            "SELECT COUNT(*) FROM input",
+            QueryId::new("query-global-rejected").unwrap(),
+            RemoteStageConfig::new("http://127.0.0.1:9"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SparkXError::Unsupported(message) if message.contains("multi-stage merge planning")
+    ));
 }

@@ -229,7 +229,9 @@ in-memory, worker-lifetime result sink—not durable shuffle—and currently has
 `StagePlan`, polls explicit stage status, expands terminal failures with per-partition attempt errors,
 propagates cancellation and timeout to the coordinator, downloads every output block, verifies a
 consistent Arrow schema, and only then performs best-effort deletion. It deliberately does not claim
-to fragment or merge an arbitrary SQL physical plan; that remains the `Session` integration step.
+to fragment or merge an arbitrary SQL physical plan. `Session::execute_sql_remote` uses the runner for
+the semantics-preserving partition-local subset (`Scan`, `Filter`, and `Projection`) and rejects every
+global operator before submission. Aggregation, join, sort, and limit require multi-stage merge planning.
 
 `sparkx-coordinator` hosts the same state and Flight service in a standalone process with configurable
 bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. The local
@@ -247,6 +249,10 @@ Every operator records emitted rows/batches and elapsed nanoseconds under its ID
 partition attempts aggregate into the same operator entry. Query metrics also report current and
 peak reserved memory. A production version would add per-operator memory, histograms, spill bytes,
 remote fetch time, and OpenTelemetry spans.
+
+For remote SQL, the current driver snapshot records fetched output, transferred block bytes, task
+count, and wall time. Worker-side scan/operator/memory metrics are not yet aggregated back into the
+driver's `QueryResult`.
 
 ## Core invariants
 
@@ -293,8 +299,8 @@ flowchart LR
 ```
 
 Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
-processes, a bounded worker-hosted Flight output sink, and a single-stage remote driver now exist. The
-next step is to make `Session` fragment and submit remote stage graphs, merge their manifests, and repartition intermediate
+processes, a bounded worker-hosted Flight output sink, a single-stage remote driver, and partition-local
+remote SQL now exist. The next step is to make `Session` fragment and submit global stage graphs, merge partial results, and repartition intermediate
 blocks; durable/object-store shuffle follows that integration.
 
 ## Non-goals for version 0.1
