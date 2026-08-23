@@ -1,15 +1,15 @@
 //! In-process distributed runner.
 //!
-//! This is intentionally a transport-free prototype: it schedules partition tasks onto a
-//! bounded worker pool, produces Arrow partial aggregates, performs an in-memory exchange,
-//! and merges them. Replacing the task and exchange adapters with RPC/Arrow Flight is the
-//! next scaling step; the physical operators do not change.
+//! It schedules partition tasks onto a bounded worker pool, produces Arrow partial aggregates,
+//! sends them through a query-scoped loopback Arrow Flight exchange, and merges them. Moving the
+//! same transport boundary to remote workers still requires plan serialization and coordination.
 
 use crate::error::{Result, SparkXError};
 use crate::execution::{
     PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
 };
 use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
+use crate::flight_exchange::{LoopbackFlightExchange, ShuffleExchange};
 use crate::memory::QueryMemory;
 use crate::row_key::{EncodedKey, RowKeyEncoder, encoded_key_memory_bytes};
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -126,6 +126,7 @@ impl LocalCluster {
             });
         }
 
+        let mut exchange = LoopbackFlightExchange::start().await?;
         let mut partial_batches = Vec::with_capacity(partitions);
         let mut shuffle_reservation = context.memory.try_reserve(0)?;
         while let Some(result) = tasks.join_next().await {
@@ -133,10 +134,26 @@ impl LocalCluster {
             let batch = result.map_err(|error| {
                 SparkXError::execution(format!("worker task failed: {error}"))
             })??;
-            context.metrics.add_shuffled_rows(batch.num_rows());
-            shuffle_reservation.try_grow(batch.get_array_memory_size() as u64)?;
-            partial_batches.push(batch);
+            let input_bytes = batch.get_array_memory_size() as u64;
+            shuffle_reservation.try_grow(input_bytes)?;
+            let transported = exchange.exchange(batch.schema(), vec![batch]).await?;
+            context.cancellation.check()?;
+            let output_bytes = transported
+                .iter()
+                .map(|batch| batch.get_array_memory_size() as u64)
+                .sum::<u64>();
+            if output_bytes > input_bytes {
+                shuffle_reservation.try_grow(output_bytes - input_bytes)?;
+            } else {
+                shuffle_reservation.shrink(input_bytes - output_bytes);
+            }
+            context
+                .metrics
+                .add_shuffled_rows(transported.iter().map(RecordBatch::num_rows).sum());
+            context.metrics.add_shuffled_bytes(output_bytes);
+            partial_batches.extend(transported);
         }
+        exchange.close().await?;
         context.cancellation.check()?;
         let final_batch = merge_partials(
             &partial_batches,

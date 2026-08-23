@@ -10,6 +10,7 @@ pub mod distributed;
 pub mod error;
 pub mod execution;
 pub mod expr;
+mod flight_exchange;
 pub mod logical;
 pub mod memory;
 pub mod metrics;

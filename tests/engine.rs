@@ -495,6 +495,7 @@ async fn local_cluster_matches_native_aggregate() {
     assert!(cluster.distributed);
     assert_eq!(cluster.stages, 2);
     assert!(cluster.metrics.shuffled_rows > 0);
+    assert!(cluster.metrics.shuffled_bytes > 0);
     assert_eq!(cluster.metrics.operators.len(), 2);
     assert_eq!(cluster.metrics.operators[0].operator_id, 0);
     assert_eq!(cluster.metrics.operators[0].name, "HashAggregate");
@@ -870,6 +871,7 @@ async fn single_partition_csv_safely_falls_back_to_native() {
     assert_eq!(result.stages, 1);
     assert_eq!(result.metrics.tasks, 1);
     assert_eq!(result.metrics.shuffled_rows, 0);
+    assert_eq!(result.metrics.shuffled_bytes, 0);
     assert_eq!(
         value_at(result.batches[0].column(0).as_ref(), 0).unwrap(),
         ScalarValue::UInt64(2)

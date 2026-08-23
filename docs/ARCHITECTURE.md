@@ -2,7 +2,7 @@
 
 ## Scope
 
-SparkX is a single-node vectorized engine plus a transport-free distributed execution prototype. The control plane parses, validates, optimizes, fragments, and schedules. The data plane scans Arrow batches, evaluates kernels, moves bounded streams between operators, and materializes only at pipeline breakers.
+SparkX is a single-node vectorized engine plus an in-process distributed execution prototype with a loopback Arrow Flight data-plane transport. The control plane parses, validates, optimizes, fragments, and schedules. The data plane scans Arrow batches, evaluates kernels, moves bounded streams between operators, and materializes only at pipeline breakers.
 
 The current design is intentionally compact enough for one person to trace in a debugger.
 
@@ -24,7 +24,7 @@ flowchart LR
     E -->|local cluster| D["Stage scheduler"]
     D --> W1["Worker task 1"]
     D --> W2["Worker task N"]
-    W1 --> X["Arrow partial exchange"]
+    W1 --> X["Loopback Arrow Flight exchange"]
     W2 --> X
     X --> A["Final aggregate"]
     N --> R["Arrow batches + metrics + plans"]
@@ -165,7 +165,7 @@ flowchart TB
     F --> Q["Semaphore-limited task queue"]
     Q --> T0["Partition task 0\nscan → filter → partial aggregate"]
     Q --> TN["Partition task N\nscan → filter → partial aggregate"]
-    T0 --> E["In-process Arrow exchange"]
+    T0 --> E["Loopback Flight exchange"]
     TN --> E
     E --> M["Merge by group key"]
     M --> O["Final batch"]
@@ -181,13 +181,13 @@ Stage 1 executes one task per source partition, limited by the configured worker
 | MAX | candidate | maximum candidate |
 | AVG | sum + count | total sum / total count |
 
-Stage 2 groups partial Arrow rows and merges them. `shuffled_rows` records the size of this exchange. Unsupported distributed shapes—including distinct aggregates, which need a set-aware exchange—intentionally fall back to native execution and report `distributed = false`; they do not silently pretend to be distributed.
+Each partial batch is Arrow-encoded by a Flight client, sent through gRPC to a query-scoped server on an ephemeral loopback port, echoed through `DoExchange`, and decoded before stage 2 groups and merges it. `shuffled_rows` and `shuffled_bytes` record the logical size of this exchange. The server is shut down with the query, and transport failures become query errors. Unsupported distributed shapes—including distinct aggregates, which need a set-aware exchange—intentionally fall back to native execution and report `distributed = false`; they do not silently pretend to be distributed.
 
 The transport-neutral contracts in `protocol.rs` define versioned coordinator assignments and
 worker registration, heartbeat, task-state, lease, cancellation, and immutable shuffle-block
 messages. IDs and cross-message ownership are validated before use, and the contracts round-trip
 through Serde. `StagePlan.plan_fragment` is deliberately opaque until a physical-plan codec lands.
-These types are not wired into `LocalCluster` and do not imply that an RPC service exists.
+These control-plane types are not wired into `LocalCluster`. The existing Flight service carries only Arrow shuffle batches; it does not yet register workers, assign tasks, or serialize physical plans.
 
 ### 7. Observability and query result
 
@@ -231,7 +231,7 @@ propagation, idempotent output commits, bounded retries, durable storage, and co
 flowchart LR
     subgraph Now["Prototype: one process"]
         C0["Coordinator"] --> WP["Tokio worker pool"]
-        WP --> MX["Memory exchange"]
+        WP --> MX["Loopback Flight exchange"]
     end
     subgraph Next["Distributed services"]
         API["SQL/API gateway"] --> CO["Coordinator"]
@@ -242,7 +242,7 @@ flowchart LR
     end
 ```
 
-The seam to replace is `LocalCluster`: fragment the physical plan at exchange boundaries, serialize fragments, send them through Arrow Flight/gRPC, and make the current per-partition execution entry point the worker RPC handler.
+The data-plane transport seam now exists inside `LocalCluster`. The next step is to fragment and serialize physical plans, move task execution behind worker RPC handlers, and connect the existing coordinator/worker contracts to a control-plane service.
 
 ## Non-goals for version 0.1
 

@@ -1,12 +1,12 @@
 # SparkX Distributed Query Engine
 
-SparkX is a scrappy, inspectable query-engine prototype written in Rust. It owns the full path from SQL text to Arrow record batches: catalog lookup, logical planning, rule-based optimization, physical planning, bounded asynchronous execution, hash aggregation/joining, metrics, and a two-stage in-process distributed aggregate runner.
+SparkX is a scrappy, inspectable query-engine prototype written in Rust. It owns the full path from SQL text to Arrow record batches: catalog lookup, logical planning, rule-based optimization, physical planning, bounded asynchronous execution, hash aggregation/joining, metrics, and a two-stage in-process distributed aggregate runner with a loopback Arrow Flight exchange.
 
 It is deliberately smaller than production systems such as Daft, DataFusion, Spark, or DuckDB. The goal is to make the important engine boundaries real and runnable without hiding them behind a framework.
 
 ## Original implementation and provenance
 
-SparkX is an independently designed implementation, not a fork, translation, or code copy of Daft or another query engine. Daft and general query-engine literature informed the high-level separation of planning, optimization, execution, and scheduling. SparkX's Rust plan model, optimizer rules, operator pipelines, local-cluster protocol, metrics, CLI, tests, and documentation were written specifically for this repository. Third-party functionality is consumed only through the dependencies declared in `Cargo.toml`, including Apache Arrow, Parquet, Tokio, and `sqlparser`, under their respective licenses.
+SparkX is an independently designed implementation, not a fork, translation, or code copy of Daft or another query engine. Daft and general query-engine literature informed the high-level separation of planning, optimization, execution, and scheduling. SparkX's Rust plan model, optimizer rules, operator pipelines, local-cluster protocol, metrics, CLI, tests, and documentation were written specifically for this repository. Third-party functionality is consumed only through the dependencies declared in `Cargo.toml`, including Apache Arrow/Flight, Parquet, Tokio/Tonic, and `sqlparser`, under their respective licenses.
 
 ## What works
 
@@ -20,7 +20,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Limited-sort physical Top-K for `ORDER BY ... LIMIT`
 - Bounded Tokio channels for backpressure between streaming operators
 - Concurrent partition scans and a worker-limited local cluster
-- Two-stage partial/final distributed aggregation with an Arrow exchange boundary
+- Two-stage partial/final distributed aggregation over a loopback Arrow Flight/gRPC exchange
 - Versioned, serializable coordinator/worker protocol contracts
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing/pruning metrics, and cooperative query cancellation
@@ -73,7 +73,8 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/planner.rs` | Logical-to-physical lowering |
 | `src/protocol.rs` | Validated coordinator/worker wire contracts |
 | `src/execution.rs` | Async operators, vectorized execution, joins, sorts, aggregates |
-| `src/distributed.rs` | Local scheduler, partial aggregation, Arrow exchange and merge |
+| `src/distributed.rs` | Local scheduler, partial aggregation, Flight exchange and merge |
+| `src/flight_exchange.rs` | Query-scoped loopback Arrow Flight/gRPC transport |
 | `src/catalog.rs` | Catalog plus memory, CSV, and Parquet providers |
 | `src/expr.rs` | Expression tree, type inference, Arrow kernels, scalar state |
 | `src/row_key.rs` | Shared encoded grouping and join key format |
@@ -88,7 +89,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation runs inside one process. It exercises scheduling, partition tasks, partial aggregation, exchange accounting, and final aggregation. Serializable messages now define future worker registration, heartbeat, lease, task-attempt, cancellation, and shuffle-block boundaries, but no RPC service sends them yet; remote object storage, retries, and durable shuffle are still absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The “distributed” implementation still runs inside one process, but partial batches now cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. It exercises scheduling, partition tasks, partial aggregation, transport encoding/decoding, exchange accounting, and final aggregation. Serializable messages define future worker registration, heartbeat, lease, task-attempt, cancellation, and shuffle-block boundaries, but that control protocol and physical plans are not wired to remote workers yet; remote object storage, retries, and durable shuffle are still absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

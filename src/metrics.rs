@@ -14,6 +14,7 @@ pub struct QueryMetrics {
     bytes_scanned: AtomicU64,
     pruned_partitions: AtomicU64,
     shuffled_rows: AtomicU64,
+    shuffled_bytes: AtomicU64,
     tasks: AtomicU64,
     elapsed_ns: AtomicU64,
     memory_reserved_bytes: AtomicU64,
@@ -32,6 +33,7 @@ pub struct MetricsSnapshot {
     pub bytes_scanned: u64,
     pub pruned_partitions: u64,
     pub shuffled_rows: u64,
+    pub shuffled_bytes: u64,
     pub tasks: u64,
     pub elapsed_ns: u64,
     pub memory_reserved_bytes: u64,
@@ -69,6 +71,10 @@ impl QueryMetrics {
 
     pub fn add_shuffled_rows(&self, rows: usize) {
         self.shuffled_rows.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_shuffled_bytes(&self, bytes: u64) {
+        self.shuffled_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn add_task(&self) {
@@ -124,6 +130,7 @@ impl QueryMetrics {
             bytes_scanned: self.bytes_scanned.load(Ordering::Relaxed),
             pruned_partitions: self.pruned_partitions.load(Ordering::Relaxed),
             shuffled_rows: self.shuffled_rows.load(Ordering::Relaxed),
+            shuffled_bytes: self.shuffled_bytes.load(Ordering::Relaxed),
             tasks: self.tasks.load(Ordering::Relaxed),
             elapsed_ns: self.elapsed_ns.load(Ordering::Relaxed),
             memory_reserved_bytes: self.memory_reserved_bytes.load(Ordering::Relaxed),

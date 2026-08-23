@@ -126,7 +126,7 @@ async fn run() -> Result<()> {
         println!(
             "runner: {} ({} stage{})",
             if result.distributed {
-                "local-cluster"
+                "local-flight"
             } else {
                 "native"
             },

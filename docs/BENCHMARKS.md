@@ -15,7 +15,7 @@ The initial fixture contains 262,144 sales rows in eight Arrow partitions plus a
 | `native_queries` | `full_sort` | global ordering with all rows returned | rows/s, peak RSS |
 | `native_queries` | `top_k` | limited ordering with 100 rows returned | rows/s, peak RSS |
 | `native_queries` | `hash_join` | dimension build and fact probe | rows/s, peak RSS |
-| `local_cluster` | `two_stage_hash_aggregate` | scheduling, partial states, exchange, final merge | rows/s, shuffle rows |
+| `local_cluster` | `two_stage_hash_aggregate` | scheduling, partial states, loopback Flight exchange, final merge | rows/s, shuffle rows/bytes |
 
 Run it:
 
