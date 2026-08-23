@@ -216,10 +216,11 @@ messages, decodes assigned plans against its local catalog, runs concurrent leas
 shared memory accounting, and reports terminal states. The `sparkx-worker` CLI builds a CSV/Parquet
 catalog from repeatable `--table NAME=PATH` arguments and shuts down cooperatively on Ctrl+C.
 
-There is no standalone coordinator executable, authentication, or TLS yet. Remote worker output is
-counted but has no remote shuffle/result sink, so a successful attempt currently reports an empty block
-manifest. The local runner also deliberately allows only one attempt until retryable error
-classification and idempotent output commits are implemented.
+`sparkx-coordinator` hosts the same state and Flight service in a standalone process with configurable
+bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. Authentication
+and TLS are not implemented. Remote worker output is counted but has no remote shuffle/result sink, so
+a successful attempt currently reports an empty block manifest. The local runner also deliberately
+allows only one attempt until retryable error classification and idempotent output commits are implemented.
 
 ### 7. Observability and query result
 
@@ -276,7 +277,7 @@ flowchart LR
     end
 ```
 
-The data-plane transport, physical-plan serialization, deterministic coordinator state, Flight control service, and standalone worker now exist. The next step is to add a standalone coordinator executable and connect remote task output to a durable or recomputable Flight shuffle sink.
+The data-plane transport, physical-plan serialization, deterministic coordinator state, Flight control service, and standalone coordinator/worker processes now exist. The next step is to connect remote task output to a durable or recomputable Flight shuffle sink and make the query driver consume its manifests.
 
 ## Non-goals for version 0.1
 

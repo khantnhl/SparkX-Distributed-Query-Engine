@@ -18,6 +18,10 @@ path = "src/bin/sparkx.rs"
 name = "sparkx-worker"
 path = "src/bin/sparkx-worker.rs"
 
+[[bin]]
+name = "sparkx-coordinator"
+path = "src/bin/sparkx-coordinator.rs"
+
 [[bench]]
 name = "engine"
 harness = false

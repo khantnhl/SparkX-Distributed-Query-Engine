@@ -87,8 +87,8 @@ The local cluster now drives real queries through coordinator assignments and wo
 An Arrow Flight `DoAction` control service now transports stage submission, registration, heartbeats,
 worker-specific assignment polling, task updates, and cancellation over gRPC. A standalone worker
 runtime now executes leased plan fragments against its own catalog, heartbeats during concurrent
-work, and acknowledges cancellation. A coordinator executable and the remote output/shuffle sink
-remain open.
+work, and acknowledges cancellation. A standalone coordinator executable hosts the same state and
+control service with configurable deadlines and limits. The remote output/shuffle sink remains open.
 
 Split the current `LocalCluster` seam into:
 
