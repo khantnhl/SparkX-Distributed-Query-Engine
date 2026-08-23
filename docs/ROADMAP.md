@@ -81,7 +81,9 @@ heartbeats, task attempts and leases, cancellation, task states, and immutable s
 metadata. Distributed partial batches now cross a query-scoped loopback Arrow Flight/gRPC
 transport. Versioned Protobuf fragments now encode every current physical operator and expression;
 workers resolve scans through their catalog and validate the embedded Arrow contract before running.
-Control-plane transport, a coordinator state machine, and remote execution remain open.
+An in-memory coordinator now enforces worker resources, heartbeat timeouts, dependency-aware
+scheduling, task leases, bounded attempts, ownership, output-block retention, and cancellation.
+Control-plane transport and remote execution remain open.
 
 Split the current `LocalCluster` seam into:
 
@@ -100,7 +102,7 @@ flowchart LR
 Implement:
 
 - Protobuf plan fragments and Arrow Flight/gRPC batch transport (implemented in the local-cluster path)
-- Worker registration, resources, heartbeat, leases, and task attempts
+- Worker registration, resources, heartbeat, leases, and task attempts (state machine implemented; RPC wiring remains)
 - Exchange partitioning, backpressure, checksums, and durable/recomputable blocks
 - Query cancellation and deadlines propagated to every task
 - Retry policy with idempotent stage output commits

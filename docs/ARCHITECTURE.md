@@ -194,8 +194,15 @@ worker catalog and rejects schema drift before execution.
 
 `LocalCluster` now executes its worker input from this decoded fragment, so local-distributed tests
 exercise the same serialization boundary required by a remote worker. The remaining control-plane
-types are not yet wired into a service: Flight carries Arrow shuffle batches, but it does not register
-workers or assign tasks over RPC.
+state is implemented by the transport-independent `Coordinator`. It deterministically selects live
+workers, gates stages on successful dependencies, leases partition attempts, requeues timed-out or
+retryable attempts within a configured bound, validates task ownership, retains successful shuffle
+blocks, and cancels query state. Heartbeat and lease deadlines are driven by caller-supplied timestamps,
+which keeps the state machine deterministic in tests.
+
+The state machine is not yet hosted by a service: Flight carries Arrow shuffle batches, but it does not
+register workers or assign tasks over RPC. `LocalCluster` also retains its direct Tokio scheduling path,
+so coordinator retries are state transitions rather than re-executed local tasks today.
 
 ### 7. Observability and query result
 
@@ -250,7 +257,7 @@ flowchart LR
     end
 ```
 
-The data-plane transport and physical-plan serialization seams now exist inside `LocalCluster`. The next step is to move task execution behind worker RPC handlers and connect the existing coordinator/worker contracts to a control-plane service.
+The data-plane transport, physical-plan serialization, and deterministic coordinator state now exist. The next step is to host the coordinator behind a control-plane service, move task execution behind worker RPC handlers, and connect those paths to the existing Flight data plane.
 
 ## Non-goals for version 0.1
 

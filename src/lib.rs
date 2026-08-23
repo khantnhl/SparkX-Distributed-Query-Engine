@@ -6,6 +6,7 @@
 
 pub mod cancellation;
 pub mod catalog;
+pub mod coordinator;
 pub mod distributed;
 pub mod error;
 pub mod execution;
