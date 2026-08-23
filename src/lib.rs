@@ -17,6 +17,7 @@ pub mod optimizer;
 pub mod planner;
 pub mod protocol;
 mod pruning;
+mod row_key;
 pub mod session;
 
 pub use cancellation::CancellationToken;

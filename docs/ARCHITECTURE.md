@@ -137,10 +137,10 @@ Scans run partitions concurrently. Expressions dispatch to Arrow comparison, boo
 
 Pipeline breakers collect their input:
 
-- Hash aggregate stores one state vector per grouping key.
+- Hash aggregate encodes evaluated group columns into Arrow's comparable row format and stores one state vector per byte key.
 - Sort concatenates batches and produces global lexicographic indices.
 - Top-K also concatenates its input, but uses Arrow's limited sort and materializes only the best `K` rows. Its current index workspace may still scale with input size.
-- Hash join builds a key-to-row-index map on the right, then emits matched (or left-null-extended) rows.
+- Hash join uses the same encoded row format for build/probe keys, skips keys containing SQL `NULL`, then emits matched (or left-null-extended) rows.
 
 Each task context carries a query-scoped memory manager. Buffered pipeline-breaker input, aggregate
 and join hash state, full-sort or Top-K index working sets, and local-distributed partial/shuffle state acquire RAII
@@ -148,6 +148,12 @@ reservations against the configured byte limit. Arrow batches use their reported
 Rust hash structures use conservative retained-value estimates. Exceeding the limit returns
 `SparkXError::ResourceExhausted`, and dropping a reservation returns its bytes. Spill files and
 pressure callbacks remain future work.
+
+The shared row-key encoder converts key columns once per batch, hashes compact encoded bytes, and
+decodes group keys directly back into Arrow arrays. Temporary encoded batches and retained byte
+keys both participate in query memory accounting. The local-distributed final merge uses the same
+encoding as native aggregation, avoiding per-row `Vec<ScalarValue>` key construction in all three
+hash paths.
 
 ### 6. Local distributed execution
 

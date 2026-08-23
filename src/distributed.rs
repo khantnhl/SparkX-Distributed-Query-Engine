@@ -11,11 +11,11 @@ use crate::execution::{
 };
 use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
 use crate::memory::QueryMemory;
+use crate::row_key::{EncodedKey, RowKeyEncoder, encoded_key_memory_bytes};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
@@ -266,25 +266,30 @@ fn merge_partials(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut state_reservation = memory.try_reserve(0)?;
-    let mut groups: HashMap<Vec<ScalarValue>, Vec<MergeState>> = HashMap::new();
+    let key_encoder = RowKeyEncoder::new(
+        schema
+            .fields()
+            .iter()
+            .take(group_count)
+            .map(|field| field.data_type().clone()),
+    )?;
+    let mut groups: HashMap<EncodedKey, Vec<MergeState>> = HashMap::new();
     if group_count == 0 {
         state_reservation.try_grow(merge_group_memory_bytes(&[], functions.len()))?;
-        groups.insert(Vec::new(), new_merge_states(&functions));
+        groups.insert(EncodedKey::default(), new_merge_states(&functions));
     }
 
     for batch in batches {
+        let group_columns = batch.columns()[..group_count].to_vec();
+        let encoded_keys = key_encoder.encode(&group_columns, batch.num_rows())?;
+        let _encoded_reservation = memory.try_reserve(encoded_keys.memory_size())?;
         for row in 0..batch.num_rows() {
-            let key = (0..group_count)
-                .map(|column| value_at(batch.column(column).as_ref(), row))
-                .collect::<Result<Vec<_>>>()?;
-            let states = match groups.entry(key) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    state_reservation
-                        .try_grow(merge_group_memory_bytes(entry.key(), functions.len()))?;
-                    entry.insert(new_merge_states(&functions))
-                }
-            };
+            let key = encoded_keys.key(row);
+            if !groups.contains_key(key) {
+                state_reservation.try_grow(merge_group_memory_bytes(key, functions.len()))?;
+                groups.insert(EncodedKey::from(key), new_merge_states(&functions));
+            }
+            let states = groups.get_mut(key).expect("encoded merge key was inserted");
             let mut column = group_count;
             for (function, state) in functions.iter().zip(states.iter_mut()) {
                 match (function, state) {
@@ -328,12 +333,11 @@ fn merge_partials(
     }
 
     let mut entries = groups.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| compare_keys(left, right));
-    let mut columns = vec![Vec::with_capacity(entries.len()); schema.fields().len()];
-    for (key, states) in entries {
-        for (index, value) in key.into_iter().enumerate() {
-            columns[index].push(value);
-        }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let (keys, state_rows): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+    let mut arrays = key_encoder.decode(&keys)?;
+    let mut columns = vec![Vec::with_capacity(state_rows.len()); aggregates.len()];
+    for states in state_rows {
         for (index, state) in states.into_iter().enumerate() {
             let value = match state {
                 MergeState::Count(value) => ScalarValue::UInt64(value),
@@ -355,31 +359,22 @@ fn merge_partials(
                     }
                 }
             };
-            columns[group_count + index].push(value);
+            columns[index].push(value);
         }
     }
-    let arrays = columns
-        .iter()
-        .zip(schema.fields())
-        .map(|(values, field)| scalars_to_array(values, field.data_type()))
-        .collect::<Result<Vec<_>>>()?;
+    arrays.extend(
+        columns
+            .iter()
+            .zip(schema.fields().iter().skip(group_count))
+            .map(|(values, field)| scalars_to_array(values, field.data_type()))
+            .collect::<Result<Vec<_>>>()?,
+    );
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
-fn merge_group_memory_bytes(key: &[ScalarValue], state_count: usize) -> u64 {
-    let key_bytes = key
-        .iter()
-        .fold(size_of::<Vec<ScalarValue>>() as u64, |total, value| {
-            let dynamic = match value {
-                ScalarValue::Utf8(value) => value.capacity() as u64,
-                _ => 0,
-            };
-            total
-                .saturating_add(size_of::<ScalarValue>() as u64)
-                .saturating_add(dynamic)
-        });
+fn merge_group_memory_bytes(key: &[u8], state_count: usize) -> u64 {
     32_u64
-        .saturating_add(key_bytes)
+        .saturating_add(encoded_key_memory_bytes(key))
         .saturating_add(size_of::<Vec<MergeState>>() as u64)
         .saturating_add((state_count as u64).saturating_mul(size_of::<MergeState>() as u64))
 }
@@ -448,15 +443,4 @@ fn merge_extreme(
         *current = Some(candidate);
     }
     Ok(())
-}
-
-fn compare_keys(left: &[ScalarValue], right: &[ScalarValue]) -> Ordering {
-    for (left, right) in left.iter().zip(right) {
-        match left.partial_compare(right) {
-            Some(Ordering::Equal) => continue,
-            Some(ordering) => return ordering,
-            None => return Ordering::Equal,
-        }
-    }
-    left.len().cmp(&right.len())
 }

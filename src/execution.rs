@@ -5,6 +5,7 @@ use crate::expr::{AggregateFunction, Expr, ScalarValue, evaluate, scalars_to_arr
 use crate::logical::{JoinType, SortExpr};
 use crate::memory::{MemoryReservation, QueryMemory};
 use crate::metrics::MetricsRef;
+use crate::row_key::{EncodedKey, RowKeyEncoder, encoded_key_memory_bytes, key_has_null};
 use arrow::array::BooleanArray;
 use arrow::compute::kernels::filter::filter_record_batch;
 use arrow::compute::{
@@ -12,7 +13,6 @@ use arrow::compute::{
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -1006,11 +1006,18 @@ pub(crate) fn hash_aggregate_with_memory(
         .map(aggregate_spec)
         .collect::<Result<Vec<_>>>()?;
     let mut state_reservation = memory.try_reserve(0)?;
-    let mut groups: HashMap<Vec<ScalarValue>, Vec<AggregateState>> = HashMap::new();
+    let key_encoder = RowKeyEncoder::new(
+        schema
+            .fields()
+            .iter()
+            .take(group_exprs.len())
+            .map(|field| field.data_type().clone()),
+    )?;
+    let mut groups: HashMap<EncodedKey, Vec<AggregateState>> = HashMap::new();
     if group_exprs.is_empty() {
         state_reservation.try_grow(aggregate_group_memory_bytes(&[], specs.len()))?;
         groups.insert(
-            Vec::new(),
+            EncodedKey::default(),
             specs
                 .iter()
                 .map(|(function, _, distinct)| AggregateState::new(*function, *distinct))
@@ -1030,27 +1037,24 @@ pub(crate) fn hash_aggregate_with_memory(
                 _ => evaluate(expr, batch).map(Some),
             })
             .collect::<Result<Vec<_>>>()?;
+        let encoded_keys = key_encoder.encode(&group_arrays, batch.num_rows())?;
+        let _encoded_reservation = memory.try_reserve(encoded_keys.memory_size())?;
 
         for row in 0..batch.num_rows() {
-            let key = group_arrays
-                .iter()
-                .map(|array| value_at(array.as_ref(), row))
-                .collect::<Result<Vec<_>>>()?;
-            let states = match groups.entry(key) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    state_reservation
-                        .try_grow(aggregate_group_memory_bytes(entry.key(), specs.len()))?;
-                    entry.insert(
-                        specs
-                            .iter()
-                            .map(|(function, _, distinct)| {
-                                AggregateState::new(*function, *distinct)
-                            })
-                            .collect(),
-                    )
-                }
-            };
+            let key = encoded_keys.key(row);
+            if !groups.contains_key(key) {
+                state_reservation.try_grow(aggregate_group_memory_bytes(key, specs.len()))?;
+                groups.insert(
+                    EncodedKey::from(key),
+                    specs
+                        .iter()
+                        .map(|(function, _, distinct)| AggregateState::new(*function, *distinct))
+                        .collect(),
+                );
+            }
+            let states = groups
+                .get_mut(key)
+                .expect("encoded aggregate key was inserted");
             for (index, state) in states.iter_mut().enumerate() {
                 let value = match &aggregate_arrays[index] {
                     None => ScalarValue::Boolean(true),
@@ -1063,22 +1067,22 @@ pub(crate) fn hash_aggregate_with_memory(
     }
 
     let mut entries = groups.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| compare_keys(left, right));
-    let column_count = group_exprs.len() + aggregate_exprs.len();
-    let mut columns = vec![Vec::with_capacity(entries.len()); column_count];
-    for (key, states) in entries {
-        for (index, value) in key.into_iter().enumerate() {
-            columns[index].push(value);
-        }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let (keys, state_rows): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+    let mut arrays = key_encoder.decode(&keys)?;
+    let mut columns = vec![Vec::with_capacity(state_rows.len()); aggregate_exprs.len()];
+    for states in state_rows {
         for (index, state) in states.into_iter().enumerate() {
-            columns[group_exprs.len() + index].push(state.finish());
+            columns[index].push(state.finish());
         }
     }
-    let arrays = columns
-        .iter()
-        .zip(schema.fields())
-        .map(|(values, field)| scalars_to_array(values, field.data_type()))
-        .collect::<Result<Vec<_>>>()?;
+    arrays.extend(
+        columns
+            .iter()
+            .zip(schema.fields().iter().skip(group_exprs.len()))
+            .map(|(values, field)| scalars_to_array(values, field.data_type()))
+            .collect::<Result<Vec<_>>>()?,
+    );
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
@@ -1101,9 +1105,9 @@ fn scalar_vec_memory_bytes(values: &[ScalarValue]) -> u64 {
     )
 }
 
-fn aggregate_group_memory_bytes(key: &[ScalarValue], state_count: usize) -> u64 {
+fn aggregate_group_memory_bytes(key: &[u8], state_count: usize) -> u64 {
     HASH_ENTRY_OVERHEAD_BYTES
-        .saturating_add(scalar_vec_memory_bytes(key))
+        .saturating_add(encoded_key_memory_bytes(key))
         .saturating_add(size_of::<Vec<AggregateState>>() as u64)
         .saturating_add((state_count as u64).saturating_mul(size_of::<AggregateState>() as u64))
 }
@@ -1119,17 +1123,6 @@ fn aggregate_spec(expr: &Expr) -> Result<(AggregateFunction, Expr, bool)> {
             "expected aggregate expression, got {other}"
         ))),
     }
-}
-
-fn compare_keys(left: &[ScalarValue], right: &[ScalarValue]) -> std::cmp::Ordering {
-    for (left, right) in left.iter().zip(right) {
-        match left.partial_compare(right) {
-            Some(std::cmp::Ordering::Equal) => continue,
-            Some(ordering) => return ordering,
-            None => return std::cmp::Ordering::Equal,
-        }
-    }
-    left.len().cmp(&right.len())
 }
 
 fn hash_join(
@@ -1153,39 +1146,42 @@ fn hash_join(
             )
         });
     let mut state_reservation = memory.try_reserve(0)?;
-    let mut build: HashMap<Vec<ScalarValue>, Vec<Vec<ScalarValue>>> = HashMap::new();
+    let mut key_encoder = None;
+    let mut build: HashMap<EncodedKey, Vec<Vec<ScalarValue>>> = HashMap::new();
     for batch in right_batches {
         let keys = right_on
             .iter()
             .map(|expr| evaluate(expr, batch))
             .collect::<Result<Vec<_>>>()?;
+        if key_encoder.is_none() {
+            key_encoder = Some(RowKeyEncoder::from_columns(&keys)?);
+        }
+        let encoded_keys = key_encoder
+            .as_ref()
+            .expect("join key encoder was initialized")
+            .encode(&keys, batch.num_rows())?;
+        let _encoded_reservation = memory.try_reserve(encoded_keys.memory_size())?;
         for row in 0..batch.num_rows() {
-            let key = keys
-                .iter()
-                .map(|array| value_at(array.as_ref(), row))
-                .collect::<Result<Vec<_>>>()?;
-            if key.iter().any(|value| value == &ScalarValue::Null) {
+            if key_has_null(&keys, row) {
                 continue;
             }
+            let key = encoded_keys.key(row);
             let values = batch
                 .columns()
                 .iter()
                 .map(|array| value_at(array.as_ref(), row))
                 .collect::<Result<Vec<_>>>()?;
             let row_bytes = scalar_vec_memory_bytes(&values);
-            match build.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    state_reservation.try_grow(row_bytes)?;
-                    entry.get_mut().push(values);
-                }
-                Entry::Vacant(entry) => {
-                    let entry_bytes = HASH_ENTRY_OVERHEAD_BYTES
-                        .saturating_add(scalar_vec_memory_bytes(entry.key()))
-                        .saturating_add(size_of::<Vec<Vec<ScalarValue>>>() as u64)
-                        .saturating_add(row_bytes);
-                    state_reservation.try_grow(entry_bytes)?;
-                    entry.insert(vec![values]);
-                }
+            if let Some(rows) = build.get_mut(key) {
+                state_reservation.try_grow(row_bytes)?;
+                rows.push(values);
+            } else {
+                let entry_bytes = HASH_ENTRY_OVERHEAD_BYTES
+                    .saturating_add(encoded_key_memory_bytes(key))
+                    .saturating_add(size_of::<Vec<Vec<ScalarValue>>>() as u64)
+                    .saturating_add(row_bytes);
+                state_reservation.try_grow(entry_bytes)?;
+                build.insert(EncodedKey::from(key), vec![values]);
             }
         }
     }
@@ -1196,17 +1192,24 @@ fn hash_join(
             .iter()
             .map(|expr| evaluate(expr, batch))
             .collect::<Result<Vec<_>>>()?;
+        if key_encoder.is_none() {
+            key_encoder = Some(RowKeyEncoder::from_columns(&keys)?);
+        }
+        let encoded_keys = key_encoder
+            .as_ref()
+            .expect("join key encoder was initialized")
+            .encode(&keys, batch.num_rows())?;
+        let _encoded_reservation = memory.try_reserve(encoded_keys.memory_size())?;
         for row in 0..batch.num_rows() {
-            let key = keys
-                .iter()
-                .map(|array| value_at(array.as_ref(), row))
-                .collect::<Result<Vec<_>>>()?;
+            let key = encoded_keys.key(row);
             let left_values = batch
                 .columns()
                 .iter()
                 .map(|array| value_at(array.as_ref(), row))
                 .collect::<Result<Vec<_>>>()?;
-            if let Some(matches) = build.get(&key) {
+            if !key_has_null(&keys, row)
+                && let Some(matches) = build.get(key)
+            {
                 for right_values in matches {
                     let mut output = left_values.clone();
                     output.extend(right_values.clone());

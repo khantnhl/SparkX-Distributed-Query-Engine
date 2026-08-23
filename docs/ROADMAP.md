@@ -45,14 +45,15 @@ In progress: the query-scoped reservation manager, configurable byte limit, type
 error, peak-memory metric, and accounting for blocking native/distributed operators are
 implemented. Ordered limits now lower to a physical Top-K operator with a paired full-sort
 benchmark, and Parquet scans prune impossible row groups using footer statistics. Pressure
-callbacks, spill files, bloom filters, and page pruning remain open.
+callbacks, spill files, bloom filters, and page pruning remain open. Native aggregation, hash join,
+and distributed final merge now share encoded Arrow row keys instead of scalar-vector hash keys.
 
 Implement:
 
 - Query-scoped memory manager with reservations and pressure callbacks
 - Spillable aggregate, join, sort, and shuffle files
 - Streaming hash-join output and partitioned/radix hash tables
-- Dictionary-aware strings and encoded group/join keys
+- Encoded group/join keys (implemented); dictionary-preserving key paths remain open
 - Top-K operator for ordered limits (implemented; streaming input reduction remains open)
 - Fused expression evaluation and reusable output buffers
 - Parquet row-group statistics pruning (implemented); bloom/page pruning and reader predicates remain open
@@ -136,7 +137,7 @@ Exit criterion: repeatable deployment, security review, SLOs, runbooks, and reco
 3. Fix ambiguity/scoping and implement complete NULL boolean semantics.
 4. Add per-operator metrics and query cancellation tokens.
 5. Introduce a memory reservation interface and account all hash tables.
-6. Replace row-wise scalar hash keys with encoded Arrow key buffers.
+6. Replace row-wise scalar hash keys with encoded Arrow key buffers. (Implemented.)
 7. Implement top-K and benchmark it against full sort plus limit. (Implemented.)
 8. Push Parquet row-group predicates using statistics. (Implemented.)
 9. Define serializable stage/partition/task protocol types. (Implemented.)

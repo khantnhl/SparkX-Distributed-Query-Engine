@@ -16,6 +16,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Arrow-native columnar batches and vectorized expression kernels
 - CSV and Parquet scans, Parquet statistics pruning, and in-memory tables
 - Rule-based filter and projection pushdown
+- Encoded Arrow row keys for native/distributed grouping and hash joins
 - Limited-sort physical Top-K for `ORDER BY ... LIMIT`
 - Bounded Tokio channels for backpressure between streaming operators
 - Concurrent partition scans and a worker-limited local cluster
@@ -75,6 +76,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/distributed.rs` | Local scheduler, partial aggregation, Arrow exchange and merge |
 | `src/catalog.rs` | Catalog plus memory, CSV, and Parquet providers |
 | `src/expr.rs` | Expression tree, type inference, Arrow kernels, scalar state |
+| `src/row_key.rs` | Shared encoded grouping and join key format |
 | `src/memory.rs` | Query memory limits and RAII reservations |
 | `src/metrics.rs` | Lock-free query counters and snapshots |
 | `benches/engine.rs` | Expression and end-to-end Criterion benchmarks |

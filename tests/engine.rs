@@ -175,6 +175,22 @@ fn grouped_totals(result: &sparkx::QueryResult) -> BTreeMap<String, (u64, f64)> 
     values
 }
 
+fn result_rows(result: &sparkx::QueryResult) -> Vec<Vec<ScalarValue>> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row| {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| value_at(column.as_ref(), row).unwrap())
+                    .collect()
+            })
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn filters_projects_sorts_and_limits() {
     let result = session(false)
@@ -332,6 +348,89 @@ async fn native_grouped_aggregates_are_correct() {
 }
 
 #[tokio::test]
+async fn encoded_multi_column_group_keys_match_across_runners() {
+    fn keyed_session(distributed: bool) -> Session {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"), Some("a"), None])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2)])),
+                    Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+                ],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![Some(2), Some(1), Some(2)])),
+                    Arc::new(Float64Array::from(vec![4.0, 5.0, 6.0])),
+                ],
+            )
+            .unwrap(),
+        ];
+        let session = Session::new(SessionConfig {
+            distributed,
+            workers: 2,
+            ..SessionConfig::default()
+        });
+        session.register_memory(
+            "keyed",
+            MemoryTable::new(
+                schema,
+                batches.into_iter().map(|batch| vec![batch]).collect(),
+            )
+            .unwrap(),
+        );
+        session
+    }
+
+    let sql = "SELECT category, code, COUNT(*) AS rows, SUM(amount) AS total \
+               FROM keyed GROUP BY category, code";
+    let native = keyed_session(false).execute_sql(sql).await.unwrap();
+    let cluster = keyed_session(true).execute_sql(sql).await.unwrap();
+    let rows = result_rows(&native);
+
+    assert_eq!(result_rows(&cluster), rows);
+    assert_eq!(rows.len(), 4);
+    for expected in [
+        vec![
+            ScalarValue::Null,
+            ScalarValue::Int64(2),
+            ScalarValue::UInt64(2),
+            ScalarValue::Float64(9.0),
+        ],
+        vec![
+            ScalarValue::Utf8("a".to_owned()),
+            ScalarValue::Int64(1),
+            ScalarValue::UInt64(2),
+            ScalarValue::Float64(3.0),
+        ],
+        vec![
+            ScalarValue::Utf8("a".to_owned()),
+            ScalarValue::Int64(2),
+            ScalarValue::UInt64(1),
+            ScalarValue::Float64(4.0),
+        ],
+        vec![
+            ScalarValue::Utf8("b".to_owned()),
+            ScalarValue::Int64(1),
+            ScalarValue::UInt64(1),
+            ScalarValue::Float64(5.0),
+        ],
+    ] {
+        assert!(rows.contains(&expected));
+    }
+    assert!(cluster.distributed);
+}
+
+#[tokio::test]
 async fn aggregate_states_cover_distinct_avg_min_and_max() {
     let result = session(false)
         .execute_sql(
@@ -377,6 +476,14 @@ async fn global_aggregates_handle_empty_input() {
         value_at(result.batches[0].column(1).as_ref(), 0).unwrap(),
         ScalarValue::Null
     );
+
+    let grouped = session
+        .execute_sql("SELECT region, COUNT(*) AS rows FROM empty_sales GROUP BY region")
+        .await
+        .unwrap();
+    assert_eq!(grouped.row_count(), 0);
+    assert_eq!(grouped.batches.len(), 1);
+    assert_eq!(grouped.batches[0].num_columns(), 2);
 }
 
 #[tokio::test]
@@ -481,6 +588,51 @@ async fn executes_inner_hash_join() {
         .await
         .unwrap();
     assert_eq!(result.row_count(), 8);
+}
+
+#[tokio::test]
+async fn encoded_multi_column_join_keys_preserve_matches() {
+    let session = session(false);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("customer_id", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(10), Some(20), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("east"),
+                Some("west"),
+                Some("east"),
+            ])),
+            Arc::new(StringArray::from(vec!["east-10", "west-20", "null-key"])),
+        ],
+    )
+    .unwrap();
+    session.register_memory(
+        "lookup",
+        MemoryTable::new(schema, vec![vec![batch]]).unwrap(),
+    );
+
+    let result = session
+        .execute_sql(
+            "SELECT sales.id, lookup.label FROM sales JOIN lookup \
+             ON sales.customer_id = lookup.customer_id AND sales.region = lookup.region \
+             ORDER BY sales.id",
+        )
+        .await
+        .unwrap();
+    let rows = result_rows(&result);
+    assert_eq!(rows.len(), 8);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row[0], ScalarValue::Int64(index as i64));
+        assert_eq!(
+            row[1],
+            ScalarValue::Utf8(if index % 2 == 0 { "east-10" } else { "west-20" }.to_owned())
+        );
+    }
 }
 
 #[tokio::test]

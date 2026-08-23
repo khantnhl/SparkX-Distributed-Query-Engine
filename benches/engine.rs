@@ -118,6 +118,10 @@ fn query_pipeline(c: &mut Criterion) {
             "SELECT region, COUNT(*) AS rows, SUM(amount) AS revenue, AVG(amount) AS average FROM sales GROUP BY region",
         ),
         (
+            "multi_key_hash_aggregate",
+            "SELECT region, customer_id, COUNT(*) AS rows, SUM(amount) AS revenue FROM sales GROUP BY region, customer_id",
+        ),
+        (
             "full_sort",
             "SELECT id, amount FROM sales ORDER BY amount DESC",
         ),
