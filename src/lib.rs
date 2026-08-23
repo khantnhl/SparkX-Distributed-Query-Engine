@@ -23,6 +23,7 @@ pub mod protocol;
 mod pruning;
 mod row_key;
 pub mod session;
+pub mod worker;
 
 pub use cancellation::CancellationToken;
 pub use error::{Result, SparkXError};

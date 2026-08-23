@@ -85,8 +85,10 @@ An in-memory coordinator now enforces worker resources, heartbeat timeouts, depe
 scheduling, task leases, bounded attempts, ownership, output-block retention, and cancellation.
 The local cluster now drives real queries through coordinator assignments and worker task updates.
 An Arrow Flight `DoAction` control service now transports stage submission, registration, heartbeats,
-worker-specific assignment polling, task updates, and cancellation over gRPC. Standalone service
-processes and remote execution remain open.
+worker-specific assignment polling, task updates, and cancellation over gRPC. A standalone worker
+runtime now executes leased plan fragments against its own catalog, heartbeats during concurrent
+work, and acknowledges cancellation. A coordinator executable and the remote output/shuffle sink
+remain open.
 
 Split the current `LocalCluster` seam into:
 

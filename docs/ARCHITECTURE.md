@@ -210,9 +210,16 @@ retains each cancelling lease and worker slot until the worker acknowledges canc
 lease/heartbeat expires, preventing new work from overbooking a worker that is still stopping.
 
 The local query runner does not connect through this service yet; its task handlers remain Tokio
-closures in the same process. The control service has no standalone executable, authentication, or TLS,
-and the local runner deliberately allows only one attempt until retryable error classification and
-idempotent output commits are implemented.
+closures in the same process. `RemoteWorker` provides the separate-process execution loop: it
+registers resources, heartbeats with live slot/memory availability, polls worker-specific control
+messages, decodes assigned plans against its local catalog, runs concurrent leased partitions under
+shared memory accounting, and reports terminal states. The `sparkx-worker` CLI builds a CSV/Parquet
+catalog from repeatable `--table NAME=PATH` arguments and shuts down cooperatively on Ctrl+C.
+
+There is no standalone coordinator executable, authentication, or TLS yet. Remote worker output is
+counted but has no remote shuffle/result sink, so a successful attempt currently reports an empty block
+manifest. The local runner also deliberately allows only one attempt until retryable error
+classification and idempotent output commits are implemented.
 
 ### 7. Observability and query result
 
@@ -248,9 +255,9 @@ Worker tasks are not retried, shuffle is not durable, and there is no coordinato
 
 The protocol contracts now represent task attempts, leases, cancellation, heartbeats, and
 recomputable shuffle-block metadata. The Flight control service queues cancellation for workers with
-active leases; a standalone worker still needs to poll and connect that message to its cancellation
-token. The production runtime also needs deadlines, idempotent output commits, bounded retries,
-durable storage, and coordinator recovery.
+active leases; `RemoteWorker` polls those messages, cancels the matching task tokens, and acknowledges
+the terminal state before its slot is released. The production runtime still needs deadlines,
+idempotent output commits, bounded retries, durable storage, and coordinator recovery.
 
 ## Deployment shape: now and next
 
@@ -269,7 +276,7 @@ flowchart LR
     end
 ```
 
-The data-plane transport, physical-plan serialization, deterministic coordinator state, and Flight control service now exist. The next step is to add standalone coordinator and worker executables, execute assigned plans in the worker process, and connect task output to the existing Flight data plane.
+The data-plane transport, physical-plan serialization, deterministic coordinator state, Flight control service, and standalone worker now exist. The next step is to add a standalone coordinator executable and connect remote task output to a durable or recomputable Flight shuffle sink.
 
 ## Non-goals for version 0.1
 

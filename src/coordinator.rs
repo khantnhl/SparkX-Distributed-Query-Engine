@@ -683,10 +683,15 @@ impl Coordinator {
                     "task cancellation came from a worker that does not own its lease",
                 ));
             }
-            let TaskState::Cancelled { finished_at_ms, .. } = state else {
-                return Err(coordinator_error(
-                    "a cancelling task only accepts a cancelled terminal update",
-                ));
+            let finished_at_ms = match state {
+                TaskState::Succeeded { finished_at_ms, .. }
+                | TaskState::Failed { finished_at_ms, .. }
+                | TaskState::Cancelled { finished_at_ms, .. } => finished_at_ms,
+                TaskState::Running { .. } => {
+                    return Err(coordinator_error(
+                        "a cancelling task only accepts a terminal update",
+                    ));
+                }
             };
             validate_reported_time("finished", finished_at_ms, lease, received_at_ms)?;
             *partition = PartitionRuntime::Cancelled;
