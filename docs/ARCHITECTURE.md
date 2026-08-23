@@ -157,12 +157,12 @@ hash paths.
 
 ### 6. Local distributed execution
 
-The cluster path is used when a physical plan ends in a hash aggregate over a multi-partition, non-join input. Before tasks start, the worker input is encoded as a versioned Protobuf fragment and decoded through the worker catalog. This removes reliance on sharing the coordinator's in-memory plan object, even though the workers still run in the same process.
+The cluster path is used when a physical plan ends in a hash aggregate over a multi-partition, non-join input. Before tasks start, the worker input is encoded into a versioned Protobuf `StagePlan` and submitted to the coordinator. Each assigned task decodes its own fragment through the worker catalog. This removes reliance on sharing the coordinator's in-memory plan object, even though the workers still run in the same process.
 
 ```mermaid
 flowchart TB
     P["Physical aggregate"] --> F["Discover scan partitions"]
-    F --> Q["Semaphore-limited task queue"]
+    F --> Q["Coordinator assignments + leases"]
     Q --> T0["Partition task 0\nscan → filter → partial aggregate"]
     Q --> TN["Partition task N\nscan → filter → partial aggregate"]
     T0 --> E["Loopback Flight exchange"]
@@ -192,17 +192,19 @@ reject malformed or unsupported values, and carry explicit Arrow field contracts
 the catalog table name instead of a serialized `TableProvider`; decoding resolves that provider in the
 worker catalog and rejects schema drift before execution.
 
-`LocalCluster` now executes its worker input from this decoded fragment, so local-distributed tests
-exercise the same serialization boundary required by a remote worker. The remaining control-plane
-state is implemented by the transport-independent `Coordinator`. It deterministically selects live
+`LocalCluster` registers one logical worker per configured slot and requests assignments from the
+transport-independent `Coordinator`. Each Tokio worker decodes the assigned stage fragment through
+its catalog, executes only the leased partition, and reports success, failure, or cancellation as a
+validated worker message. The coordinator deterministically selects live
 workers, gates stages on successful dependencies, leases partition attempts, requeues timed-out or
 retryable attempts within a configured bound, validates task ownership, retains successful shuffle
 blocks, and cancels query state. Heartbeat and lease deadlines are driven by caller-supplied timestamps,
 which keeps the state machine deterministic in tests.
 
 The state machine is not yet hosted by a service: Flight carries Arrow shuffle batches, but it does not
-register workers or assign tasks over RPC. `LocalCluster` also retains its direct Tokio scheduling path,
-so coordinator retries are state transitions rather than re-executed local tasks today.
+register workers or assign tasks over RPC. The local task handlers remain Tokio closures in the same
+process, and the local runner deliberately allows only one attempt until retryable error classification
+and idempotent output commits are implemented.
 
 ### 7. Observability and query result
 

@@ -1,11 +1,12 @@
 //! In-process distributed runner.
 //!
-//! It schedules partition tasks onto a bounded worker pool, produces Arrow partial aggregates,
-//! sends them through a query-scoped loopback Arrow Flight exchange, and merges them. Worker input
-//! crosses the physical-plan codec boundary; moving execution off-process still requires remote
-//! coordination and task RPC handlers.
+//! It schedules partition tasks through the coordinator state machine, produces Arrow partial
+//! aggregates, sends them through a query-scoped loopback Arrow Flight exchange, and merges them.
+//! Workers consume serialized stage plans and report protocol task updates; moving execution
+//! off-process still requires remote transport and task RPC handlers.
 
 use crate::catalog::Catalog;
+use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::error::{Result, SparkXError};
 use crate::execution::{
     PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
@@ -13,7 +14,10 @@ use crate::execution::{
 use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
 use crate::flight_exchange::{LoopbackFlightExchange, ShuffleExchange};
 use crate::memory::QueryMemory;
-use crate::plan_codec::PhysicalPlanCodec;
+use crate::protocol::{
+    CoordinatorMessage, PROTOCOL_VERSION, QueryId, StageId, StagePlan, TaskState, WorkerId,
+    WorkerMessage, WorkerRegistration,
+};
 use crate::row_key::{EncodedKey, RowKeyEncoder, encoded_key_memory_bytes};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -22,7 +26,6 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 #[derive(Debug, Clone)]
@@ -98,50 +101,134 @@ impl LocalCluster {
         let started = Instant::now();
         let partial_exprs = partial_aggregate_exprs(aggregate_exprs)?;
         let partial_schema = aggregate_schema(input.schema(), group_exprs, &partial_exprs)?;
-        let worker_input = PhysicalPlanCodec::decode(
-            &PhysicalPlanCodec::encode(input.as_ref())?,
-            catalog.as_ref(),
+        let partition_count = u32::try_from(partitions).map_err(|_| {
+            SparkXError::execution(format!(
+                "local cluster partition count {partitions} exceeds the protocol limit"
+            ))
+        })?;
+        let query_id = QueryId::new("local-cluster-query")?;
+        let stage = StagePlan::from_physical_plan(
+            query_id.clone(),
+            StageId(0),
+            Vec::new(),
+            partition_count,
+            input.as_ref(),
         )?;
-        let semaphore = Arc::new(Semaphore::new(self.workers));
-        let mut tasks = JoinSet::new();
-
-        for partition in 0..partitions {
-            context.cancellation.check()?;
-            let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-                SparkXError::execution("local cluster worker pool closed unexpectedly")
-            })?;
-            let input = worker_input.clone();
-            let group_exprs = group_exprs.clone();
-            let partial_exprs = partial_exprs.clone();
-            let partial_schema = partial_schema.clone();
-            let mut task_context = context.clone();
-            task_context.partition = Some(partition);
-            tasks.spawn(async move {
-                let _permit = permit;
-                task_context.cancellation.check()?;
-                let cancellation = task_context.cancellation.clone();
-                let stream = execute(input, task_context.clone());
-                let (batches, _input_reservation) =
-                    collect_with_memory(stream, &task_context.memory).await?;
-                cancellation.check()?;
-                hash_aggregate_with_memory(
-                    &batches,
-                    &group_exprs,
-                    &partial_exprs,
-                    partial_schema,
-                    &task_context.memory,
-                )
-            });
+        let mut coordinator = Coordinator::new(CoordinatorConfig {
+            lease_duration_ms: u64::MAX / 2,
+            heartbeat_timeout_ms: u64::MAX / 2,
+            max_task_attempts: 1,
+            max_stage_partitions: partition_count,
+        })?;
+        coordinator.submit_stage(stage)?;
+        for worker_index in 0..self.workers.min(partitions) {
+            coordinator.handle_worker_message(
+                WorkerMessage::Register {
+                    version: PROTOCOL_VERSION,
+                    registration: WorkerRegistration {
+                        worker_id: WorkerId::new(format!("local-worker-{worker_index:04}"))?,
+                        slots: 1,
+                        memory_bytes: context.memory.limit_bytes(),
+                    },
+                },
+                0,
+            )?;
         }
 
+        let mut tasks = JoinSet::new();
         let mut exchange = LoopbackFlightExchange::start().await?;
         let mut partial_batches = Vec::with_capacity(partitions);
         let mut shuffle_reservation = context.memory.try_reserve(0)?;
-        while let Some(result) = tasks.join_next().await {
+        while partial_batches.len() < partitions {
             context.cancellation.check()?;
-            let batch = result.map_err(|error| {
-                SparkXError::execution(format!("worker task failed: {error}"))
-            })??;
+            while let Some(assignment) = coordinator.next_assignment(0)? {
+                let CoordinatorMessage::AssignTask {
+                    stage, task, lease, ..
+                } = assignment
+                else {
+                    return Err(SparkXError::execution(
+                        "local coordinator returned a cancellation while scheduling",
+                    ));
+                };
+                let worker_id = lease.worker_id;
+                let catalog = catalog.clone();
+                let group_exprs = group_exprs.clone();
+                let partial_exprs = partial_exprs.clone();
+                let partial_schema = partial_schema.clone();
+                let mut task_context = context.clone();
+                task_context.partition = Some(task.partition_id.0 as usize);
+                tasks.spawn(async move {
+                    let result = async {
+                        task_context.cancellation.check()?;
+                        let input = stage.decode_physical_plan(catalog.as_ref())?;
+                        let cancellation = task_context.cancellation.clone();
+                        let stream = execute(input, task_context.clone());
+                        let (batches, _input_reservation) =
+                            collect_with_memory(stream, &task_context.memory).await?;
+                        cancellation.check()?;
+                        hash_aggregate_with_memory(
+                            &batches,
+                            &group_exprs,
+                            &partial_exprs,
+                            partial_schema,
+                            &task_context.memory,
+                        )
+                    }
+                    .await;
+                    (worker_id, task, result)
+                });
+            }
+
+            let (worker_id, task, result) = tasks
+                .join_next()
+                .await
+                .ok_or_else(|| {
+                    SparkXError::execution(
+                        "local coordinator has unfinished partitions but no running tasks",
+                    )
+                })?
+                .map_err(|error| SparkXError::execution(format!("worker task failed: {error}")))?;
+            let batch = match result {
+                Ok(batch) => {
+                    coordinator.handle_worker_message(
+                        WorkerMessage::TaskUpdate {
+                            version: PROTOCOL_VERSION,
+                            worker_id,
+                            task,
+                            state: TaskState::Succeeded {
+                                finished_at_ms: 0,
+                                output_blocks: Vec::new(),
+                            },
+                        },
+                        0,
+                    )?;
+                    batch
+                }
+                Err(error) => {
+                    let state = if matches!(&error, SparkXError::Cancelled) {
+                        TaskState::Cancelled {
+                            finished_at_ms: 0,
+                            reason: "query cancellation reached local worker".to_owned(),
+                        }
+                    } else {
+                        TaskState::Failed {
+                            finished_at_ms: 0,
+                            error: error.to_string(),
+                            retryable: false,
+                        }
+                    };
+                    coordinator.handle_worker_message(
+                        WorkerMessage::TaskUpdate {
+                            version: PROTOCOL_VERSION,
+                            worker_id,
+                            task,
+                            state,
+                        },
+                        0,
+                    )?;
+                    return Err(error);
+                }
+            };
             let input_bytes = batch.get_array_memory_size() as u64;
             shuffle_reservation.try_grow(input_bytes)?;
             let transported = exchange.exchange(batch.schema(), vec![batch]).await?;

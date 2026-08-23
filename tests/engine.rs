@@ -496,6 +496,7 @@ async fn local_cluster_matches_native_aggregate() {
     assert_eq!(cluster.stages, 2);
     assert!(cluster.metrics.shuffled_rows > 0);
     assert!(cluster.metrics.shuffled_bytes > 0);
+    assert_eq!(cluster.metrics.tasks, 4);
     assert_eq!(cluster.metrics.operators.len(), 2);
     assert_eq!(cluster.metrics.operators[0].operator_id, 0);
     assert_eq!(cluster.metrics.operators[0].name, "HashAggregate");

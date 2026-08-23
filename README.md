@@ -19,7 +19,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Encoded Arrow row keys for native/distributed grouping and hash joins
 - Limited-sort physical Top-K for `ORDER BY ... LIMIT`
 - Bounded Tokio channels for backpressure between streaming operators
-- Concurrent partition scans and a worker-limited local cluster
+- Concurrent partition scans and a coordinator-dispatched, worker-limited local cluster
 - Two-stage partial/final distributed aggregation over a loopback Arrow Flight/gRPC exchange
 - Versioned Protobuf physical-plan fragments with worker-side catalog and schema validation
 - Versioned, serializable coordinator/worker protocol contracts
@@ -93,7 +93,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation still runs inside one process, but worker inputs are serialized as versioned Protobuf physical-plan fragments and partial batches cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. It exercises plan decoding through a worker catalog, scheduling, partition tasks, partial aggregation, transport encoding/decoding, exchange accounting, and final aggregation. Serializable messages and a deterministic in-memory coordinator enforce worker registration, heartbeats, leases, bounded attempts, cancellation, and shuffle-block ownership, but task assignment is not wired to a remote control-plane service yet. Remote object storage, actual retry execution, and durable shuffle are still absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The “distributed” implementation still runs inside one process, but the local cluster now registers logical workers, obtains coordinator assignments, decodes each versioned Protobuf stage plan through the worker catalog, and reports task outcomes through the protocol state machine. Partial batches cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. This exercises the control and data boundaries without claiming separate machines: no remote control-plane service or worker RPC server exists yet. Remote object storage, retry execution, and durable shuffle are also absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

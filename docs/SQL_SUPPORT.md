@@ -66,8 +66,9 @@ The current local-cluster runner uses two-stage execution only for a non-distinc
 aggregate over a join-free input with more than one scan partition. Other query shapes execute
 natively and report `distributed = false` rather than pretending to be distributed. Eligible
 worker inputs round-trip through a versioned Protobuf physical-plan fragment and resolve scans from
-the worker catalog. Their partial batches then cross a query-scoped loopback Arrow Flight/gRPC
-exchange before the final merge.
+the worker catalog. Logical workers receive those fragments as coordinator assignments and report
+their task outcomes through the control protocol. Their partial batches then cross a query-scoped
+loopback Arrow Flight/gRPC exchange before the final merge.
 
 CSV files expose one partition. Memory tables can contain multiple explicit partitions, and each
 Parquet row group is a partition.
