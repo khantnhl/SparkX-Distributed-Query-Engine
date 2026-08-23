@@ -84,7 +84,9 @@ workers resolve scans through their catalog and validate the embedded Arrow cont
 An in-memory coordinator now enforces worker resources, heartbeat timeouts, dependency-aware
 scheduling, task leases, bounded attempts, ownership, output-block retention, and cancellation.
 The local cluster now drives real queries through coordinator assignments and worker task updates.
-Control-plane transport and remote execution remain open.
+An Arrow Flight `DoAction` control service now transports stage submission, registration, heartbeats,
+worker-specific assignment polling, task updates, and cancellation over gRPC. Standalone service
+processes and remote execution remain open.
 
 Split the current `LocalCluster` seam into:
 
@@ -103,7 +105,7 @@ flowchart LR
 Implement:
 
 - Protobuf plan fragments and Arrow Flight/gRPC batch transport (implemented in the local-cluster path)
-- Worker registration, resources, heartbeat, leases, and task attempts (state machine and local-runner wiring implemented; RPC remains)
+- Worker registration, resources, heartbeat, leases, and task attempts (state machine, local runner, and Flight RPC transport implemented)
 - Exchange partitioning, backpressure, checksums, and durable/recomputable blocks
 - Query cancellation and deadlines propagated to every task
 - Retry policy with idempotent stage output commits

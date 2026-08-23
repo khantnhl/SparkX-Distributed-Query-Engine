@@ -2,7 +2,7 @@
 
 ## Scope
 
-SparkX is a single-node vectorized engine plus an in-process distributed execution prototype with a loopback Arrow Flight data-plane transport. The control plane parses, validates, optimizes, fragments, and schedules. The data plane scans Arrow batches, evaluates kernels, moves bounded streams between operators, and materializes only at pipeline breakers.
+SparkX is a single-node vectorized engine plus an in-process distributed execution prototype with Arrow Flight/gRPC control- and data-plane transports. The control plane parses, validates, optimizes, fragments, and schedules. The data plane scans Arrow batches, evaluates kernels, moves bounded streams between operators, and materializes only at pipeline breakers.
 
 The current design is intentionally compact enough for one person to trace in a debugger.
 
@@ -195,16 +195,22 @@ worker catalog and rejects schema drift before execution.
 `LocalCluster` registers one logical worker per configured slot and requests assignments from the
 transport-independent `Coordinator`. Each Tokio worker decodes the assigned stage fragment through
 its catalog, executes only the leased partition, and reports success, failure, or cancellation as a
-validated worker message. The coordinator deterministically selects live
-workers, gates stages on successful dependencies, leases partition attempts, requeues timed-out or
+validated worker message. The coordinator deterministically selects live workers, gates stages on
+successful dependencies, leases partition attempts, requeues timed-out or
 retryable attempts within a configured bound, validates task ownership, retains successful shuffle
 blocks, and cancels query state. Heartbeat and lease deadlines are driven by caller-supplied timestamps,
 which keeps the state machine deterministic in tests.
 
-The state machine is not yet hosted by a service: Flight carries Arrow shuffle batches, but it does not
-register workers or assign tasks over RPC. The local task handlers remain Tokio closures in the same
-process, and the local runner deliberately allows only one attempt until retryable error classification
-and idempotent output commits are implemented.
+`control_plane.rs` hosts the state machine behind typed Arrow Flight `DoAction` calls. The service
+accepts stage submissions, worker lifecycle messages, worker-specific assignment polls, task updates,
+and query cancellation. Requests and responses are bounded to 96 MiB, validated before mutation, and
+mapped to explicit gRPC status codes. Cancelling a query queues a control message for every worker
+holding one of its leases, and polling returns those messages before new assignments.
+
+The local query runner does not connect through this service yet; its task handlers remain Tokio
+closures in the same process. The control service has no standalone executable, authentication, or TLS,
+and the local runner deliberately allows only one attempt until retryable error classification and
+idempotent output commits are implemented.
 
 ### 7. Observability and query result
 
@@ -239,8 +245,10 @@ progress cannot be interrupted, but its stream is detached and its eventual outp
 Worker tasks are not retried, shuffle is not durable, and there is no coordinator recovery.
 
 The protocol contracts now represent task attempts, leases, cancellation, heartbeats, and
-recomputable shuffle-block metadata. The production runtime still needs deadlines, remote
-propagation, idempotent output commits, bounded retries, durable storage, and coordinator recovery.
+recomputable shuffle-block metadata. The Flight control service queues cancellation for workers with
+active leases; a standalone worker still needs to poll and connect that message to its cancellation
+token. The production runtime also needs deadlines, idempotent output commits, bounded retries,
+durable storage, and coordinator recovery.
 
 ## Deployment shape: now and next
 
@@ -259,7 +267,7 @@ flowchart LR
     end
 ```
 
-The data-plane transport, physical-plan serialization, and deterministic coordinator state now exist. The next step is to host the coordinator behind a control-plane service, move task execution behind worker RPC handlers, and connect those paths to the existing Flight data plane.
+The data-plane transport, physical-plan serialization, deterministic coordinator state, and Flight control service now exist. The next step is to add standalone coordinator and worker executables, execute assigned plans in the worker process, and connect task output to the existing Flight data plane.
 
 ## Non-goals for version 0.1
 

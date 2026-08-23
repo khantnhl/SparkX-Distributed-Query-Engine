@@ -146,6 +146,32 @@ impl Coordinator {
             .map(|worker| worker.available_slots)
     }
 
+    pub fn active_workers_for_query(&self, query_id: &QueryId) -> Result<Vec<WorkerId>> {
+        if !self
+            .stages
+            .keys()
+            .any(|(stage_query_id, _)| stage_query_id == query_id)
+        {
+            return Err(SparkXError::NotFound(format!(
+                "query {} is not registered with the coordinator",
+                query_id.as_str()
+            )));
+        }
+        let mut workers = self
+            .stages
+            .iter()
+            .filter(|((stage_query_id, _), _)| stage_query_id == query_id)
+            .flat_map(|(_, stage)| stage.partitions.iter())
+            .filter_map(|partition| match partition {
+                PartitionRuntime::Active { worker_id, .. } => Some(worker_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        workers.sort();
+        workers.dedup();
+        Ok(workers)
+    }
+
     pub fn submit_stage(&mut self, stage: StagePlan) -> Result<()> {
         stage.validate()?;
         if stage.partition_count > self.config.max_stage_partitions {
@@ -227,6 +253,32 @@ impl Coordinator {
             return Ok(None);
         };
 
+        self.assign_to_worker(worker_id, now_ms)
+    }
+
+    pub fn next_assignment_for(
+        &mut self,
+        worker_id: &WorkerId,
+        now_ms: u64,
+    ) -> Result<Option<CoordinatorMessage>> {
+        self.advance_time(now_ms)?;
+        let worker = self.workers.get(worker_id).ok_or_else(|| {
+            coordinator_error(format!(
+                "unregistered worker {} requested an assignment",
+                worker_id.as_str()
+            ))
+        })?;
+        if !worker.alive || worker.available_slots == 0 {
+            return Ok(None);
+        }
+        self.assign_to_worker(worker_id.clone(), now_ms)
+    }
+
+    fn assign_to_worker(
+        &mut self,
+        worker_id: WorkerId,
+        now_ms: u64,
+    ) -> Result<Option<CoordinatorMessage>> {
         let Some((stage_key, partition_index, attempt)) = self.next_pending_partition() else {
             return Ok(None);
         };

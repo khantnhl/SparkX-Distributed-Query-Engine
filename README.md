@@ -24,6 +24,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Versioned Protobuf physical-plan fragments with worker-side catalog and schema validation
 - Versioned, serializable coordinator/worker protocol contracts
 - Deterministic coordinator state for worker heartbeats, task leases, retries, and cancellation
+- Arrow Flight/gRPC control actions for stage submission and remote worker lifecycle messages
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing/pruning metrics, and cooperative query cancellation
 - Query-scoped memory reservations with a configurable limit and peak-memory metric
@@ -76,6 +77,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/plan_codec.rs` | Versioned Protobuf physical-plan fragment codec |
 | `src/protocol.rs` | Validated coordinator/worker wire contracts |
 | `src/coordinator.rs` | Worker registry, stage scheduler, leases, retries, and cancellation |
+| `src/control_plane.rs` | Flight/gRPC server and typed client for coordinator/worker messages |
 | `src/execution.rs` | Async operators, vectorized execution, joins, sorts, aggregates |
 | `src/distributed.rs` | Local scheduler, partial aggregation, Flight exchange and merge |
 | `src/flight_exchange.rs` | Query-scoped loopback Arrow Flight/gRPC transport |
@@ -93,7 +95,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation still runs inside one process, but the local cluster now registers logical workers, obtains coordinator assignments, decodes each versioned Protobuf stage plan through the worker catalog, and reports task outcomes through the protocol state machine. Partial batches cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. This exercises the control and data boundaries without claiming separate machines: no remote control-plane service or worker RPC server exists yet. Remote object storage, retry execution, and durable shuffle are also absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The “distributed” implementation still runs inside one process, but the local cluster now registers logical workers, obtains coordinator assignments, decodes each versioned Protobuf stage plan through the worker catalog, and reports task outcomes through the protocol state machine. Partial batches cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. A separate Flight `DoAction` service can transport stage submissions, worker registration and heartbeats, assignment polling, task updates, and cancellation; its lifecycle is exercised over a real loopback connection. There is not yet a standalone coordinator or worker executable, remote catalog configuration, retry execution, remote object storage, or durable shuffle. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

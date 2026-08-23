@@ -1,7 +1,7 @@
 //! Transport-neutral coordinator and worker protocol contracts.
 //!
-//! The local runner does not send these messages yet. They define stable, validated ownership
-//! boundaries for the future RPC layer without coupling protocol types to a specific transport.
+//! The local runner and Flight control-plane transport use these messages as stable, validated
+//! ownership boundaries without coupling scheduling state to one transport implementation.
 
 use crate::catalog::Catalog;
 use crate::execution::PhysicalPlan;

@@ -141,6 +141,42 @@ fn schedules_ready_stages_deterministically_and_unblocks_dependencies() {
 }
 
 #[test]
+fn worker_specific_polling_never_leases_another_workers_task() {
+    let mut coordinator = coordinator(100, 50, 3);
+    coordinator.submit_stage(stage(0, Vec::new(), 2)).unwrap();
+    register(&mut coordinator, "worker-a", 1, 0);
+    register(&mut coordinator, "worker-b", 1, 0);
+    let worker_a = WorkerId::new("worker-a").unwrap();
+    let worker_b = WorkerId::new("worker-b").unwrap();
+
+    let first = coordinator
+        .next_assignment_for(&worker_b, 1)
+        .unwrap()
+        .unwrap();
+    let CoordinatorMessage::AssignTask { task, lease, .. } = first else {
+        panic!("expected task assignment");
+    };
+    assert_eq!(lease.worker_id, worker_b);
+    assert_eq!(task.partition_id, PartitionId(0));
+    assert!(
+        coordinator
+            .next_assignment_for(&lease.worker_id, 1)
+            .unwrap()
+            .is_none()
+    );
+
+    let second = coordinator
+        .next_assignment_for(&worker_a, 1)
+        .unwrap()
+        .unwrap();
+    let CoordinatorMessage::AssignTask { task, lease, .. } = second else {
+        panic!("expected task assignment");
+    };
+    assert_eq!(lease.worker_id, worker_a);
+    assert_eq!(task.partition_id, PartitionId(1));
+}
+
+#[test]
 fn validates_registration_and_heartbeat_resources() {
     assert!(
         Coordinator::new(CoordinatorConfig {
