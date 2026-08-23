@@ -8,6 +8,7 @@ pub mod cancellation;
 pub mod catalog;
 pub mod control_plane;
 pub mod coordinator;
+pub mod data_plane;
 pub mod distributed;
 pub mod error;
 pub mod execution;

@@ -2,8 +2,8 @@
 
 use crate::coordinator::Coordinator;
 use crate::protocol::{
-    CoordinatorMessage, PROTOCOL_VERSION, QueryId, StagePlan, WorkerHeartbeat, WorkerId,
-    WorkerMessage, WorkerRegistration,
+    CoordinatorMessage, PROTOCOL_VERSION, QueryId, ShuffleBlock, StageId, StagePlan,
+    WorkerHeartbeat, WorkerId, WorkerMessage, WorkerRegistration,
 };
 use crate::{Result, SparkXError};
 use arrow_flight::error::FlightError;
@@ -32,6 +32,7 @@ const ACTION_SUBMIT_STAGE: &str = "sparkx.control.submit_stage";
 const ACTION_WORKER_MESSAGE: &str = "sparkx.control.worker_message";
 const ACTION_POLL_ASSIGNMENT: &str = "sparkx.control.poll_assignment";
 const ACTION_CANCEL_QUERY: &str = "sparkx.control.cancel_query";
+const ACTION_STAGE_OUTPUT_BLOCKS: &str = "sparkx.control.stage_output_blocks";
 
 /// Upper bound for one control request or response, including JSON expansion of plan bytes.
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 96 * 1024 * 1024;
@@ -52,6 +53,12 @@ struct PollAssignmentResponse {
 struct CancelQueryRequest {
     query_id: QueryId,
     reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StageOutputBlocksRequest {
+    query_id: QueryId,
+    stage_id: StageId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +223,18 @@ impl ControlPlaneClient {
             .await?;
         message.validate()?;
         Ok(message)
+    }
+
+    pub async fn stage_output_blocks(
+        &mut self,
+        query_id: QueryId,
+        stage_id: StageId,
+    ) -> Result<Vec<ShuffleBlock>> {
+        self.call(
+            ACTION_STAGE_OUTPUT_BLOCKS,
+            &StageOutputBlocksRequest { query_id, stage_id },
+        )
+        .await
     }
 
     async fn call<T, U>(&mut self, action_type: &str, request: &T) -> Result<U>
@@ -413,6 +432,17 @@ impl FlightService for ControlPlaneFlightService {
                 }
                 encode_response(&message)?
             }
+            ACTION_STAGE_OUTPUT_BLOCKS => {
+                let request: StageOutputBlocksRequest =
+                    decode_request(&action.body, ACTION_STAGE_OUTPUT_BLOCKS)?;
+                let blocks = self
+                    .coordinator
+                    .lock()
+                    .await
+                    .stage_output_blocks(&request.query_id, request.stage_id)
+                    .map_err(map_status)?;
+                encode_response(&blocks)?
+            }
             other => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported SparkX control action {other}"
@@ -444,6 +474,10 @@ impl FlightService for ControlPlaneFlightService {
             (
                 ACTION_CANCEL_QUERY,
                 "Cancel all unfinished work for a query",
+            ),
+            (
+                ACTION_STAGE_OUTPUT_BLOCKS,
+                "Read the output manifests for a successful stage",
             ),
         ]
         .into_iter()

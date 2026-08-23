@@ -28,6 +28,9 @@ pub enum SparkXError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    #[error("transport error: {0}")]
+    Transport(String),
+
     #[error("resource not found: {0}")]
     NotFound(String),
 
@@ -56,6 +59,10 @@ impl SparkXError {
 
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol(message.into())
+    }
+
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::Transport(message.into())
     }
 
     pub fn resource_exhausted(message: impl Into<String>) -> Self {

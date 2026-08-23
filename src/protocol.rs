@@ -125,8 +125,12 @@ pub struct TaskAttemptId {
 }
 
 impl TaskAttemptId {
+    pub fn validate(&self) -> Result<()> {
+        self.query_id.validate()
+    }
+
     pub fn validate_for(&self, stage: &StagePlan) -> Result<()> {
-        self.query_id.validate()?;
+        self.validate()?;
         if self.query_id != stage.query_id {
             return Err(protocol_error("task query does not match its stage"));
         }
@@ -163,8 +167,17 @@ impl TaskLease {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "location", rename_all = "snake_case")]
 pub enum ShuffleLocation {
-    Worker { worker_id: WorkerId },
-    ObjectStore { uri: String },
+    Worker {
+        worker_id: WorkerId,
+    },
+    Flight {
+        worker_id: WorkerId,
+        endpoint: String,
+        ticket: String,
+    },
+    ObjectStore {
+        uri: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +207,31 @@ impl ShuffleBlock {
                     return Err(protocol_error(
                         "in-memory shuffle block must be owned by the reporting worker",
                     ));
+                }
+            }
+            ShuffleLocation::Flight {
+                worker_id,
+                endpoint,
+                ticket,
+            } => {
+                worker_id.validate()?;
+                if worker_id != reporting_worker {
+                    return Err(protocol_error(
+                        "Flight shuffle block must be owned by the reporting worker",
+                    ));
+                }
+                let authority = endpoint
+                    .strip_prefix("http://")
+                    .or_else(|| endpoint.strip_prefix("https://"));
+                if !authority.is_some_and(|value| {
+                    !value.trim().is_empty() && !value.chars().any(char::is_whitespace)
+                }) {
+                    return Err(protocol_error(
+                        "Flight shuffle endpoint must contain an http:// or https:// authority",
+                    ));
+                }
+                if ticket.trim().is_empty() {
+                    return Err(protocol_error("Flight shuffle ticket must not be empty"));
                 }
             }
             ShuffleLocation::ObjectStore { uri } if uri.trim().is_empty() => {

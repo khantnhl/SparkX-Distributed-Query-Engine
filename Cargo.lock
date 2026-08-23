@@ -2171,6 +2171,7 @@ dependencies = [
  "arrow 59.2.0",
  "arrow-flight",
  "clap",
+ "crc32fast",
  "criterion",
  "duckdb",
  "futures",

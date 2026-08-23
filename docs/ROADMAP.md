@@ -88,7 +88,10 @@ An Arrow Flight `DoAction` control service now transports stage submission, regi
 worker-specific assignment polling, task updates, and cancellation over gRPC. A standalone worker
 runtime now executes leased plan fragments against its own catalog, heartbeats during concurrent
 work, and acknowledges cancellation. A standalone coordinator executable hosts the same state and
-control service with configurable deadlines and limits. The remote output/shuffle sink remains open.
+control service with configurable deadlines and limits. Remote workers now retain bounded Arrow output
+behind Flight `DoPut`/`DoGet`, report owner/endpoint/ticket/checksum manifests, and support verified
+download and explicit deletion. Session-level remote graph submission, repartitioned exchange, and
+durable shuffle remain open.
 
 Split the current `LocalCluster` seam into:
 
@@ -108,7 +111,7 @@ Implement:
 
 - Protobuf plan fragments and Arrow Flight/gRPC batch transport (implemented in the local-cluster path)
 - Worker registration, resources, heartbeat, leases, and task attempts (state machine, local runner, and Flight RPC transport implemented)
-- Exchange partitioning, backpressure, checksums, and durable/recomputable blocks
+- Exchange partitioning, backpressure, checksums (worker output implemented), and durable/recomputable blocks
 - Query cancellation and deadlines propagated to every task
 - Retry policy with idempotent stage output commits
 - Broadcast and hash-shuffle joins; range-partitioned global sort

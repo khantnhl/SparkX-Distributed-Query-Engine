@@ -3,6 +3,7 @@ use sparkx::catalog::{Catalog, CsvTable, ParquetTable, TableRef};
 use sparkx::protocol::WorkerId;
 use sparkx::worker::{RemoteWorker, WorkerConfig};
 use sparkx::{CancellationToken, Result, SparkXError};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -74,6 +75,18 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     poll_ms: u64,
 
+    /// Interface and port for serving task output over Arrow Flight.
+    #[arg(long, default_value = "127.0.0.1:0")]
+    data_bind: SocketAddr,
+
+    /// Hostname or IP advertised to output consumers. Required with 0.0.0.0/:: binds.
+    #[arg(long)]
+    data_advertised_host: Option<String>,
+
+    /// Maximum bytes retained for task output until consumers delete blocks.
+    #[arg(long, default_value_t = sparkx::DEFAULT_MEMORY_LIMIT_BYTES)]
+    data_storage_bytes: u64,
+
     /// Exit after this many terminal task attempts; intended for development and tests.
     #[arg(long)]
     max_tasks: Option<u64>,
@@ -101,6 +114,9 @@ async fn run() -> Result<()> {
     config.channel_capacity = args.channel_capacity;
     config.heartbeat_interval = Duration::from_millis(args.heartbeat_ms);
     config.poll_interval = Duration::from_millis(args.poll_ms);
+    config.data_bind_address = args.data_bind;
+    config.data_advertised_host = args.data_advertised_host;
+    config.data_storage_bytes = args.data_storage_bytes;
     config.max_terminal_tasks = args.max_tasks;
 
     let shutdown = CancellationToken::new();

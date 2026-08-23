@@ -27,6 +27,7 @@ SparkX is an independently designed implementation, not a fork, translation, or 
 - Arrow Flight/gRPC control actions for stage submission and remote worker lifecycle messages
 - Standalone `sparkx-worker` runtime with catalog-local plan decoding and cooperative cancellation
 - Standalone `sparkx-coordinator` service with configurable leases, retries, and heartbeat expiry
+- Bounded worker-hosted Flight output blocks with ownership, tickets, checksums, and deletion
 - Logical, optimized, and physical plan explanations
 - Stable per-operator IDs, output/timing/pruning metrics, and cooperative query cancellation
 - Query-scoped memory reservations with a configurable limit and peak-memory metric
@@ -70,8 +71,10 @@ cargo run --bin sparkx-worker -- \
   --table sales=./sales.parquet
 ```
 
-These processes currently exercise control, leasing, plan decoding, execution, and cancellation.
-Remote task output is not query-consumable until the shuffle/result sink lands.
+The worker serves task output from an ephemeral loopback data port by default. For another machine
+to fetch it, bind a reachable interface with `--data-bind 0.0.0.0:50052` and publish that machine's
+DNS name or IP with `--data-advertised-host`. Output is bounded by `--data-storage-bytes` and remains
+available until the consumer deletes it or the worker exits.
 
 ## Developer workflow
 
@@ -96,6 +99,7 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 | `src/protocol.rs` | Validated coordinator/worker wire contracts |
 | `src/coordinator.rs` | Worker registry, stage scheduler, leases, retries, and cancellation |
 | `src/control_plane.rs` | Flight/gRPC server and typed client for coordinator/worker messages |
+| `src/data_plane.rs` | Bounded Flight upload/download service for remote task output |
 | `src/worker.rs` | Remote worker heartbeat, polling, execution, and task reporting loop |
 | `src/bin/sparkx-worker.rs` | Standalone worker CLI and file-backed catalog setup |
 | `src/bin/sparkx-coordinator.rs` | Standalone coordinator service CLI |
@@ -116,7 +120,15 @@ On PowerShell, `./scripts/benchmark.ps1` runs the release tests and Criterion su
 
 ## Honest prototype boundaries
 
-The “distributed” implementation still runs inside one process, but the local cluster now registers logical workers, obtains coordinator assignments, decodes each versioned Protobuf stage plan through the worker catalog, and reports task outcomes through the protocol state machine. Partial batches cross a real Arrow Flight/gRPC connection bound to an ephemeral loopback port. A separate Flight `DoAction` service transports stage submissions, worker registration and heartbeats, assignment polling, task updates, and cancellation. The `sparkx-coordinator` and `sparkx-worker` executables can run that control path as separate processes, and workers build their own CSV/Parquet catalogs before executing leased partitions. There is not yet a remote result/shuffle sink, so successful remote worker batches are currently measured and discarded before an empty success manifest is reported. Retry execution, remote object storage, durable shuffle, authentication, and TLS are also absent. Blocking operators enforce a query memory limit but still fail rather than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
+The local-cluster query runner still executes its logical workers inside one process, but the standalone
+`sparkx-coordinator` and `sparkx-worker` executables now run the control and execution paths as separate
+processes. Workers publish successful task batches to bounded, worker-hosted Flight storage and report
+owner/endpoint/ticket/checksum manifests; the control client can read those manifests and a data client
+can download, verify, and delete each block. The main `Session` query driver does not yet submit a whole
+remote stage graph or merge those manifests into a `QueryResult`. Output storage is memory-only and tied
+to worker lifetime, and authentication, TLS, durable/object-store shuffle, coordinator recovery, and
+production retry commits are absent. Blocking operators enforce a query memory limit but still fail rather
+than spill to disk. Optimization is rule based, not cost based. SQL coverage is intentionally narrow.
 
 Those boundaries are explicit seams, not hidden claims. See [the roadmap](docs/ROADMAP.md) for the order in which to replace them.
 

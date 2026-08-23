@@ -3,16 +3,19 @@
 use crate::cancellation::CancellationToken;
 use crate::catalog::Catalog;
 use crate::control_plane::ControlPlaneClient;
+use crate::data_plane::{FlightDataPlaneClient, FlightDataPlaneServer};
 use crate::execution::{TaskContext, execute};
 use crate::memory::QueryMemory;
 use crate::metrics::{MetricsSnapshot, QueryMetrics};
 use crate::protocol::{
-    CoordinatorMessage, PROTOCOL_VERSION, QueryId, StagePlan, TaskAttemptId, TaskLease, TaskState,
-    WorkerHeartbeat, WorkerId, WorkerMessage, WorkerRegistration,
+    CoordinatorMessage, PROTOCOL_VERSION, QueryId, ShuffleBlock, ShuffleLocation, StagePlan,
+    TaskAttemptId, TaskLease, TaskState, WorkerHeartbeat, WorkerId, WorkerMessage,
+    WorkerRegistration,
 };
 use crate::{Result, SparkXError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
@@ -28,6 +31,9 @@ pub struct WorkerConfig {
     pub channel_capacity: usize,
     pub heartbeat_interval: Duration,
     pub poll_interval: Duration,
+    pub data_bind_address: SocketAddr,
+    pub data_advertised_host: Option<String>,
+    pub data_storage_bytes: u64,
     /// Development/test escape hatch. Production workers leave this as `None`.
     pub max_terminal_tasks: Option<u64>,
 }
@@ -43,6 +49,9 @@ impl WorkerConfig {
             channel_capacity: 2,
             heartbeat_interval: Duration::from_secs(5),
             poll_interval: Duration::from_millis(100),
+            data_bind_address: "127.0.0.1:0".parse().expect("valid loopback address"),
+            data_advertised_host: None,
+            data_storage_bytes: crate::DEFAULT_MEMORY_LIMIT_BYTES,
             max_terminal_tasks: None,
         }
     }
@@ -71,6 +80,11 @@ impl WorkerConfig {
         if self.heartbeat_interval.is_zero() || self.poll_interval.is_zero() {
             return Err(SparkXError::planning(
                 "worker heartbeat and poll intervals must be greater than zero",
+            ));
+        }
+        if self.data_storage_bytes == 0 {
+            return Err(SparkXError::planning(
+                "worker data-plane storage must be greater than zero",
             ));
         }
         if self.max_terminal_tasks == Some(0) {
@@ -104,6 +118,13 @@ impl RemoteWorker {
     }
 
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<WorkerRunSummary> {
+        let data_plane = FlightDataPlaneServer::bind(
+            self.config.data_bind_address,
+            self.config.data_advertised_host.as_deref(),
+            self.config.data_storage_bytes,
+        )
+        .await?;
+        let data_endpoint = data_plane.endpoint();
         let mut client =
             ControlPlaneClient::connect(self.config.coordinator_endpoint.clone()).await?;
         client
@@ -187,6 +208,8 @@ impl RemoteWorker {
                                         memory: memory.clone(),
                                         cancellation,
                                     },
+                                    self.config.worker_id.clone(),
+                                    data_endpoint.clone(),
                                 ));
                             }
                             CoordinatorMessage::CancelQuery { query_id, reason, .. } => {
@@ -209,6 +232,9 @@ impl RemoteWorker {
                     active.remove(&completion.task);
                     let query_cancellation = cancelled_queries.get(&completion.task.query_id);
                     let state = if let Some(reason) = query_cancellation {
+                        if let Ok(output) = &completion.result {
+                            discard_output_blocks(&output.blocks).await;
+                        }
                         summary.cancelled_tasks += 1;
                         TaskState::Cancelled {
                             finished_at_ms: completion.lease.issued_at_ms,
@@ -222,7 +248,7 @@ impl RemoteWorker {
                                 summary.output_bytes = summary.output_bytes.saturating_add(output.bytes);
                                 TaskState::Succeeded {
                                     finished_at_ms: completion.lease.issued_at_ms,
-                                    output_blocks: Vec::new(),
+                                    output_blocks: output.blocks,
                                 }
                             }
                             Err(SparkXError::Cancelled) if stopping => {
@@ -251,12 +277,20 @@ impl RemoteWorker {
                             }
                         }
                     };
-                    client.send_worker_message(WorkerMessage::TaskUpdate {
+                    let uncommitted_blocks = match &state {
+                        TaskState::Succeeded { output_blocks, .. } => output_blocks.clone(),
+                        _ => Vec::new(),
+                    };
+                    let update = client.send_worker_message(WorkerMessage::TaskUpdate {
                         version: PROTOCOL_VERSION,
                         worker_id: self.config.worker_id.clone(),
                         task: completion.task,
                         state,
-                    }).await?;
+                    }).await;
+                    if let Err(error) = update {
+                        discard_output_blocks(&uncommitted_blocks).await;
+                        return Err(error);
+                    }
 
                     if self
                         .config
@@ -271,14 +305,16 @@ impl RemoteWorker {
         }
 
         metrics.set_memory_usage(memory.reserved_bytes(), memory.peak_bytes());
-        Ok(WorkerRunSummary {
+        let result = WorkerRunSummary {
             completed_tasks: summary.completed_tasks,
             failed_tasks: summary.failed_tasks,
             cancelled_tasks: summary.cancelled_tasks,
             output_rows: summary.output_rows,
             output_bytes: summary.output_bytes,
             metrics: metrics.snapshot(),
-        })
+        };
+        data_plane.close().await?;
+        Ok(result)
     }
 }
 
@@ -293,6 +329,7 @@ struct TaskCompletion {
 struct TaskOutput {
     rows: u64,
     bytes: u64,
+    blocks: Vec<ShuffleBlock>,
 }
 
 async fn execute_assignment(
@@ -301,19 +338,24 @@ async fn execute_assignment(
     lease: TaskLease,
     catalog: Arc<Catalog>,
     mut context: TaskContext,
+    worker_id: WorkerId,
+    data_endpoint: String,
 ) -> TaskCompletion {
     context.partition = Some(task.partition_id.0 as usize);
     let result = async {
         context.cancellation.check()?;
         let plan = stage.decode_physical_plan(catalog.as_ref())?;
+        let schema = plan.schema();
         let batches = execute(plan, context.clone()).collect().await?;
         context.cancellation.check()?;
+        let mut data_client = FlightDataPlaneClient::connect(data_endpoint).await?;
+        let block = data_client
+            .upload(worker_id, task.clone(), task.partition_id, schema, batches)
+            .await?;
         Ok(TaskOutput {
-            rows: batches.iter().map(|batch| batch.num_rows() as u64).sum(),
-            bytes: batches
-                .iter()
-                .map(|batch| batch.get_array_memory_size() as u64)
-                .sum(),
+            rows: block.rows,
+            bytes: block.bytes,
+            blocks: vec![block],
         })
     }
     .await;
@@ -347,8 +389,22 @@ fn cancel_all(active: &BTreeMap<TaskAttemptId, CancellationToken>) {
     }
 }
 
+async fn discard_output_blocks(blocks: &[ShuffleBlock]) {
+    for block in blocks {
+        let ShuffleLocation::Flight { endpoint, .. } = &block.location else {
+            continue;
+        };
+        if let Ok(mut client) = FlightDataPlaneClient::connect(endpoint).await {
+            let _ = client.delete(block).await;
+        }
+    }
+}
+
 fn is_retryable(error: &SparkXError) -> bool {
-    matches!(error, SparkXError::Io(_) | SparkXError::Parquet(_))
+    matches!(
+        error,
+        SparkXError::Io(_) | SparkXError::Parquet(_) | SparkXError::Transport(_)
+    )
 }
 
 fn current_time_ms() -> u64 {

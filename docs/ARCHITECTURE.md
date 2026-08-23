@@ -203,7 +203,8 @@ which keeps the state machine deterministic in tests.
 
 `control_plane.rs` hosts the state machine behind typed Arrow Flight `DoAction` calls. The service
 accepts stage submissions, worker lifecycle messages, worker-specific assignment polls, task updates,
-and query cancellation. Requests and responses are bounded to 96 MiB, validated before mutation, and
+query cancellation, and successful-stage output-manifest reads. Requests and responses are bounded to
+96 MiB, validated before mutation, and
 mapped to explicit gRPC status codes. Cancelling a query queues a control message for every worker
 holding one of its leases, and polling returns those messages before new assignments. The coordinator
 retains each cancelling lease and worker slot until the worker acknowledges cancellation or the
@@ -216,11 +217,18 @@ messages, decodes assigned plans against its local catalog, runs concurrent leas
 shared memory accounting, and reports terminal states. The `sparkx-worker` CLI builds a CSV/Parquet
 catalog from repeatable `--table NAME=PATH` arguments and shuts down cooperatively on Ctrl+C.
 
+Each remote worker also binds a `data_plane.rs` Flight service. A completed task uploads its Arrow
+batches with `DoPut`, then reports an immutable manifest containing the worker owner, advertised
+endpoint, ticket, row/byte counts, and a CRC32 checksum. Consumers obtain successful-stage manifests
+through the control client, fetch batches with `DoGet`, verify their metadata/checksum, and explicitly
+delete consumed blocks. The store accounts retained Arrow bytes against a fixed capacity, rejects an
+oversized streaming upload while decoding it, and preserves schemas for empty results. It is an
+in-memory, worker-lifetime result sink—not durable shuffle—and currently has no authentication or TLS.
+
 `sparkx-coordinator` hosts the same state and Flight service in a standalone process with configurable
-bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. Authentication
-and TLS are not implemented. Remote worker output is counted but has no remote shuffle/result sink, so
-a successful attempt currently reports an empty block manifest. The local runner also deliberately
-allows only one attempt until retryable error classification and idempotent output commits are implemented.
+bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. The local
+runner still deliberately allows only one attempt until idempotent output commits are implemented, and
+the `Session` driver does not yet orchestrate a remote stage graph or merge remote manifests.
 
 ### 7. Observability and query result
 
@@ -252,7 +260,8 @@ Today, Arrow/I/O/planning/task errors propagate as `SparkXError`. A public, clon
 `execute_plan_with_cancellation`; native operators and local distributed tasks observe it and
 return `SparkXError::Cancelled`. Cancellation is cooperative: a blocking storage read already in
 progress cannot be interrupted, but its stream is detached and its eventual output is discarded.
-Worker tasks are not retried, shuffle is not durable, and there is no coordinator recovery.
+Transport failures are marked retryable by remote workers, but shuffle is not durable and there is no
+coordinator recovery or complete retry commit protocol.
 
 The protocol contracts now represent task attempts, leases, cancellation, heartbeats, and
 recomputable shuffle-block metadata. The Flight control service queues cancellation for workers with
@@ -277,7 +286,10 @@ flowchart LR
     end
 ```
 
-The data-plane transport, physical-plan serialization, deterministic coordinator state, Flight control service, and standalone coordinator/worker processes now exist. The next step is to connect remote task output to a durable or recomputable Flight shuffle sink and make the query driver consume its manifests.
+Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
+processes, and a bounded worker-hosted Flight output sink now exist. The next step is to make the
+`Session` driver submit remote stage graphs, consume their manifests, and repartition intermediate
+blocks; durable/object-store shuffle follows that integration.
 
 ## Non-goals for version 0.1
 

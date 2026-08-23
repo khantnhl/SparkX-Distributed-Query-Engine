@@ -232,6 +232,32 @@ fn rejects_in_memory_blocks_owned_by_another_worker() {
 }
 
 #[test]
+fn rejects_flight_blocks_with_an_invalid_owner_or_endpoint() {
+    let message = WorkerMessage::TaskUpdate {
+        version: PROTOCOL_VERSION,
+        worker_id: WorkerId::new("worker-a").unwrap(),
+        task: task(),
+        state: TaskState::Succeeded {
+            finished_at_ms: 4_000,
+            output_blocks: vec![ShuffleBlock {
+                producer: task(),
+                output_partition: PartitionId(0),
+                rows: 1,
+                bytes: 8,
+                checksum: "crc32:12345678".to_owned(),
+                location: ShuffleLocation::Flight {
+                    worker_id: WorkerId::new("worker-b").unwrap(),
+                    endpoint: "worker-b:50052".to_owned(),
+                    ticket: String::new(),
+                },
+            }],
+        },
+    };
+
+    assert!(matches!(message.validate(), Err(SparkXError::Protocol(_))));
+}
+
+#[test]
 fn rejects_workers_without_executable_resources() {
     let message = WorkerMessage::Register {
         version: PROTOCOL_VERSION,

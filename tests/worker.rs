@@ -5,8 +5,9 @@ use sparkx::CancellationToken;
 use sparkx::catalog::{Catalog, MemoryTable, TableProvider, TableRef};
 use sparkx::control_plane::{ControlPlaneClient, ControlPlaneServer};
 use sparkx::coordinator::{Coordinator, CoordinatorConfig, PartitionStatus, StageStatus};
+use sparkx::data_plane::FlightDataPlaneClient;
 use sparkx::execution::PhysicalPlan;
-use sparkx::protocol::{PartitionId, QueryId, StageId, StagePlan, WorkerId};
+use sparkx::protocol::{PartitionId, QueryId, ShuffleLocation, StageId, StagePlan, WorkerId};
 use sparkx::worker::{RemoteWorker, WorkerConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,11 @@ fn stage(query_id: QueryId, provider: TableRef, partitions: u32) -> StagePlan {
     StagePlan::from_physical_plan(query_id, StageId(0), Vec::new(), partitions, &plan).unwrap()
 }
 
-fn worker_config(endpoint: String, worker_id: WorkerId, terminal_tasks: u64) -> WorkerConfig {
+fn worker_config(
+    endpoint: String,
+    worker_id: WorkerId,
+    terminal_tasks: Option<u64>,
+) -> WorkerConfig {
     let mut config = WorkerConfig::new(endpoint, worker_id);
     config.slots = 1;
     config.memory_bytes = 16 * 1024 * 1024;
@@ -41,7 +46,7 @@ fn worker_config(endpoint: String, worker_id: WorkerId, terminal_tasks: u64) -> 
     config.channel_capacity = 2;
     config.heartbeat_interval = Duration::from_millis(20);
     config.poll_interval = Duration::from_millis(5);
-    config.max_terminal_tasks = Some(terminal_tasks);
+    config.max_terminal_tasks = terminal_tasks;
     config
 }
 
@@ -73,17 +78,53 @@ async fn remote_worker_executes_leased_partitions_over_flight_control() {
 
     let worker_id = WorkerId::new("worker-remote-a").unwrap();
     let worker = RemoteWorker::new(
-        worker_config(server.endpoint(), worker_id.clone(), 2),
+        worker_config(server.endpoint(), worker_id.clone(), None),
         catalog,
     )
     .unwrap();
-    let summary = tokio::time::timeout(
-        Duration::from_secs(5),
-        worker.run_until(CancellationToken::new()),
-    )
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(worker.run_until(shutdown.clone()));
+    let blocks = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(blocks) = admin
+                .stage_output_blocks(query_id.clone(), StageId(0))
+                .await
+            {
+                break blocks;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
     .await
-    .expect("worker should finish two partitions")
-    .unwrap();
+    .expect("worker should publish both partition outputs");
+
+    assert_eq!(blocks.len(), 2);
+    let mut values = Vec::new();
+    for block in &blocks {
+        let endpoint = match &block.location {
+            ShuffleLocation::Flight { endpoint, .. } => endpoint,
+            other => panic!("expected Flight output location, got {other:?}"),
+        };
+        let mut data_client = FlightDataPlaneClient::connect(endpoint).await.unwrap();
+        for output in data_client.download(block).await.unwrap() {
+            values.extend_from_slice(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+    }
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 2, 3, 4]);
+    shutdown.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("worker should stop after output is consumed")
+        .unwrap()
+        .unwrap();
 
     assert_eq!(summary.completed_tasks, 2);
     assert_eq!(summary.failed_tasks, 0);
@@ -163,7 +204,7 @@ async fn remote_worker_acknowledges_cancellation_before_releasing_its_slot() {
 
     let worker_id = WorkerId::new("worker-cancel-a").unwrap();
     let worker = RemoteWorker::new(
-        worker_config(server.endpoint(), worker_id.clone(), 1),
+        worker_config(server.endpoint(), worker_id.clone(), Some(1)),
         catalog,
     )
     .unwrap();
