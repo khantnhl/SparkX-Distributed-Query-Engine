@@ -762,6 +762,10 @@ enum AggregateState {
         seen: bool,
         distinct: Option<HashSet<ScalarValue>>,
     },
+    SumUInt64 {
+        value: u64,
+        seen: bool,
+    },
     Min(Option<ScalarValue>),
     Max(Option<ScalarValue>),
     Avg {
@@ -784,6 +788,10 @@ impl AggregateState {
                 float_sum: 0.0,
                 seen: false,
                 distinct: set,
+            },
+            AggregateFunction::SumUInt64 => Self::SumUInt64 {
+                value: 0,
+                seen: false,
             },
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
@@ -837,6 +845,20 @@ impl AggregateState {
                         )));
                     }
                 }
+            }
+            Self::SumUInt64 { value: sum, seen } => {
+                let ScalarValue::UInt64(value) = value else {
+                    if value == ScalarValue::Null {
+                        return Ok(());
+                    }
+                    return Err(SparkXError::execution(format!(
+                        "internal unsigned sum requires UInt64, got {value:?}"
+                    )));
+                };
+                *sum = sum.checked_add(value).ok_or_else(|| {
+                    SparkXError::execution("internal unsigned sum overflowed UInt64")
+                })?;
+                *seen = true;
             }
             Self::Min(current) => update_extreme(current, value, OrderingChoice::Min)?,
             Self::Max(current) => update_extreme(current, value, OrderingChoice::Max)?,
@@ -913,6 +935,13 @@ impl AggregateState {
                     ScalarValue::Null
                 } else {
                     ScalarValue::Float64(*float_sum + *int_sum as f64)
+                }
+            }
+            Self::SumUInt64 { value, seen } => {
+                if *seen {
+                    ScalarValue::UInt64(*value)
+                } else {
+                    ScalarValue::Null
                 }
             }
             Self::Min(value) | Self::Max(value) => value.clone().unwrap_or(ScalarValue::Null),

@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
+const STAGE_INPUT_TABLE_PREFIX: &str = "__sparkx_stage_input_";
+
+pub(crate) fn stage_input_table_name(stage_id: StageId) -> String {
+    format!("{STAGE_INPUT_TABLE_PREFIX}{}", stage_id.0)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

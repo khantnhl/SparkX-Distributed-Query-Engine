@@ -49,7 +49,7 @@ their assigned partitions, and publish Arrow output blocks for the client to ret
 - Query-scoped memory reservations for blocking operators
 - Native hash aggregation, hash joins, sorting, and limited-sort Top-K
 - Two-stage in-process distributed aggregation with partial and final merging
-- Two-stage remote aggregation with worker partials and a memory-accounted driver merge
+- Two-stage remote aggregation with direct worker-to-worker Flight input
 - Versioned Protobuf physical-plan fragments with worker-side schema validation
 - Coordinator-managed workers, slots, heartbeats, leases, attempts, retries, and cancellation
 - Dependency-aware task assignments carrying immutable upstream block manifests
@@ -70,9 +70,10 @@ See [SQL support](docs/SQL_SUPPORT.md) for the precise language and type boundar
 | Remote | `--remote-coordinator URL` | Separate processes execute partition-local plans or mergeable two-stage aggregates |
 
 Remote SQL supports `Scan`, `Filter`, and `Projection`, plus a top-level non-distinct aggregate over
-a join-free input. Workers compute partition-local aggregate states and the driver performs the
-memory-accounted final merge. Joins, sorting, limits, and distinct aggregates still require broader
-stage-graph or exchange planning and are rejected before submission.
+a join-free input. First-stage workers publish partition-local aggregate states, and a dependent
+worker fetches those immutable blocks over Flight and performs the final merge. Joins, sorting,
+limits, and distinct aggregates still require broader exchange planning and are rejected before
+submission.
 
 ## Quick start
 
@@ -167,8 +168,8 @@ cargo run --bin sparkx -- \
   --metrics
 ```
 
-Or run a mergeable aggregate. Each worker produces partial aggregate states, and the client merges
-the verified states into the final result:
+Or run a mergeable aggregate. First-stage workers produce partial aggregate states, and the
+coordinator assigns their verified block manifests to a downstream worker for the final merge:
 
 ```bash
 cargo run --bin sparkx -- \
@@ -222,7 +223,7 @@ metadata alongside the reports.
 
 ## Current limitations
 
-- Remote aggregation merges worker partials in the driver rather than a downstream worker stage.
+- Remote aggregate dependencies are materialized in the final worker's bounded query memory.
 - Remote joins, sorting, limits, and distinct aggregates do not yet have exchange and merge stages.
 - Worker output is memory-only and is lost when the worker exits.
 - The coordinator does not persist state or recover after restart.

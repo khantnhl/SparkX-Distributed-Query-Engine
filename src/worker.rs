@@ -1,18 +1,20 @@
 //! Standalone worker runtime for executing leased physical-plan fragments.
 
 use crate::cancellation::CancellationToken;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, MemoryTable};
 use crate::control_plane::ControlPlaneClient;
 use crate::data_plane::{FlightDataPlaneClient, FlightDataPlaneServer};
 use crate::execution::{TaskContext, execute};
-use crate::memory::QueryMemory;
+use crate::memory::{MemoryReservation, QueryMemory};
 use crate::metrics::{MetricsSnapshot, QueryMetrics};
 use crate::protocol::{
-    CoordinatorMessage, PROTOCOL_VERSION, QueryId, ShuffleBlock, ShuffleLocation, StagePlan,
-    TaskAttemptId, TaskLease, TaskState, WorkerHeartbeat, WorkerId, WorkerMessage,
-    WorkerRegistration,
+    CoordinatorMessage, PROTOCOL_VERSION, QueryId, ShuffleBlock, ShuffleLocation, StageId,
+    StagePlan, TaskAttemptId, TaskLease, TaskState, WorkerHeartbeat, WorkerId, WorkerMessage,
+    WorkerRegistration, stage_input_table_name,
 };
 use crate::{Result, SparkXError};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -170,7 +172,13 @@ impl RemoteWorker {
                         .await?
                     {
                         match message {
-                            CoordinatorMessage::AssignTask { stage, task, lease, .. } => {
+                            CoordinatorMessage::AssignTask {
+                                stage,
+                                task,
+                                lease,
+                                input_blocks,
+                                ..
+                            } => {
                                 if lease.worker_id != self.config.worker_id {
                                     return Err(SparkXError::protocol(format!(
                                         "worker {} received a lease owned by {}",
@@ -195,12 +203,13 @@ impl RemoteWorker {
                                 }).await?;
                                 let cancellation = CancellationToken::new();
                                 active.insert(task.clone(), cancellation.clone());
-                                tasks.spawn(execute_assignment(
+                                tasks.spawn(execute_assignment(TaskAssignmentExecution {
                                     stage,
                                     task,
                                     lease,
-                                    self.catalog.clone(),
-                                    TaskContext {
+                                    input_blocks,
+                                    catalog: self.catalog.clone(),
+                                    context: TaskContext {
                                         batch_size: self.config.batch_size,
                                         channel_capacity: self.config.channel_capacity,
                                         partition: None,
@@ -208,9 +217,9 @@ impl RemoteWorker {
                                         memory: memory.clone(),
                                         cancellation,
                                     },
-                                    self.config.worker_id.clone(),
-                                    data_endpoint.clone(),
-                                ));
+                                    worker_id: self.config.worker_id.clone(),
+                                    data_endpoint: data_endpoint.clone(),
+                                }));
                             }
                             CoordinatorMessage::CancelQuery { query_id, reason, .. } => {
                                 cancelled_queries.insert(query_id.clone(), reason);
@@ -332,19 +341,39 @@ struct TaskOutput {
     blocks: Vec<ShuffleBlock>,
 }
 
-async fn execute_assignment(
+struct TaskAssignmentExecution {
     stage: StagePlan,
     task: TaskAttemptId,
     lease: TaskLease,
+    input_blocks: Vec<ShuffleBlock>,
     catalog: Arc<Catalog>,
-    mut context: TaskContext,
+    context: TaskContext,
     worker_id: WorkerId,
     data_endpoint: String,
-) -> TaskCompletion {
+}
+
+async fn execute_assignment(assignment: TaskAssignmentExecution) -> TaskCompletion {
+    let TaskAssignmentExecution {
+        stage,
+        task,
+        lease,
+        input_blocks,
+        catalog,
+        mut context,
+        worker_id,
+        data_endpoint,
+    } = assignment;
     context.partition = Some(task.partition_id.0 as usize);
     let result = async {
         context.cancellation.check()?;
-        let plan = stage.decode_physical_plan(catalog.as_ref())?;
+        let (task_catalog, _input_reservation) = materialize_stage_inputs(
+            catalog.as_ref(),
+            &stage.input_stages,
+            &input_blocks,
+            &context.memory,
+        )
+        .await?;
+        let plan = stage.decode_physical_plan(&task_catalog)?;
         let schema = plan.schema();
         let batches = execute(plan, context.clone()).collect().await?;
         context.cancellation.check()?;
@@ -364,6 +393,101 @@ async fn execute_assignment(
         lease,
         result,
     }
+}
+
+#[derive(Debug, Default)]
+struct MaterializedStageInput {
+    schema: Option<SchemaRef>,
+    batches: Vec<RecordBatch>,
+}
+
+async fn materialize_stage_inputs(
+    base_catalog: &Catalog,
+    input_stages: &[StageId],
+    input_blocks: &[ShuffleBlock],
+    memory: &QueryMemory,
+) -> Result<(Catalog, MemoryReservation)> {
+    let task_catalog = base_catalog.snapshot();
+    let mut reservation = memory.try_reserve(0)?;
+    if input_stages.is_empty() {
+        if !input_blocks.is_empty() {
+            return Err(SparkXError::protocol(
+                "task without stage dependencies received input blocks",
+            ));
+        }
+        return Ok((task_catalog, reservation));
+    }
+
+    let mut clients = BTreeMap::<String, FlightDataPlaneClient>::new();
+    let mut materialized = input_stages
+        .iter()
+        .copied()
+        .map(|stage_id| (stage_id, MaterializedStageInput::default()))
+        .collect::<BTreeMap<_, _>>();
+    for block in input_blocks {
+        let input = materialized
+            .get_mut(&block.producer.stage_id)
+            .ok_or_else(|| {
+                SparkXError::protocol(format!(
+                    "worker received a block from undeclared stage {}",
+                    block.producer.stage_id.0
+                ))
+            })?;
+        let endpoint = match &block.location {
+            ShuffleLocation::Flight { endpoint, .. } => endpoint.clone(),
+            ShuffleLocation::Worker { .. } => {
+                return Err(SparkXError::unsupported(
+                    "remote workers cannot fetch worker-local input blocks",
+                ));
+            }
+            ShuffleLocation::ObjectStore { .. } => {
+                return Err(SparkXError::unsupported(
+                    "remote workers cannot fetch object-store input blocks yet",
+                ));
+            }
+        };
+        if !clients.contains_key(&endpoint) {
+            clients.insert(
+                endpoint.clone(),
+                FlightDataPlaneClient::connect(endpoint.clone()).await?,
+            );
+        }
+        let downloaded = clients
+            .get_mut(&endpoint)
+            .expect("data-plane client was just inserted")
+            .download_with_schema(block)
+            .await?;
+        if input
+            .schema
+            .as_ref()
+            .is_some_and(|schema| schema.as_ref() != downloaded.schema.as_ref())
+        {
+            return Err(SparkXError::protocol(format!(
+                "stage {} input blocks contain different Arrow schemas",
+                block.producer.stage_id.0
+            )));
+        }
+        input.schema.get_or_insert(downloaded.schema);
+        for batch in downloaded.batches {
+            reservation.try_grow(batch.get_array_memory_size() as u64)?;
+            input.batches.push(batch);
+        }
+    }
+
+    for stage_id in input_stages {
+        let input = materialized
+            .remove(stage_id)
+            .expect("declared input stage was initialized");
+        let schema = input.schema.ok_or_else(|| {
+            SparkXError::protocol(format!(
+                "stage {} dependency produced no input block manifest",
+                stage_id.0
+            ))
+        })?;
+        let table = MemoryTable::new(schema, vec![input.batches])?;
+        task_catalog.register(stage_input_table_name(*stage_id), Arc::new(table));
+    }
+    Ok((task_catalog, reservation))
 }
 
 #[derive(Debug, Default)]

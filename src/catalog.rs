@@ -56,6 +56,13 @@ impl Catalog {
         names.sort();
         names
     }
+
+    /// Creates a task-local catalog that initially references the same immutable providers.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            tables: RwLock::new(self.tables.read().clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

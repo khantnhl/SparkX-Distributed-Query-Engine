@@ -133,6 +133,9 @@ impl Display for Operator {
 pub enum AggregateFunction {
     Count,
     Sum,
+    /// Exact internal combiner for partition-local `COUNT` states.
+    #[doc(hidden)]
+    SumUInt64,
     Min,
     Max,
     Avg,
@@ -338,6 +341,16 @@ impl Expr {
             Self::Cast { data_type, .. } => Ok(data_type.clone()),
             Self::Aggregate { function, expr, .. } => match function {
                 AggregateFunction::Count => Ok(DataType::UInt64),
+                AggregateFunction::SumUInt64 => {
+                    let input_type = expr.data_type(schema)?;
+                    if input_type == DataType::UInt64 {
+                        Ok(DataType::UInt64)
+                    } else {
+                        Err(SparkXError::planning(format!(
+                            "internal unsigned sum requires UInt64, got {input_type}"
+                        )))
+                    }
+                }
                 AggregateFunction::Sum | AggregateFunction::Avg => {
                     let input_type = expr.data_type(schema)?;
                     if is_numeric(&input_type) {

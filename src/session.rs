@@ -189,73 +189,70 @@ impl Session {
         let physical = PhysicalPlanner::create_physical_plan(&optimized, &self.catalog)?;
         let physical_text = physical.explain();
         let metrics = QueryMetrics::default();
-        let memory = QueryMemory::new(self.config.memory_limit_bytes);
         let started = Instant::now();
         let aggregate = split_mergeable_aggregate(physical.as_ref())?;
-        let (batches, output_blocks, cleanup_errors, partition_count, stages) =
-            if let Some(aggregate) = aggregate {
-                let partition_count =
-                    remote_partition_count_from_usize(aggregate.partition_count())?;
-                let stage = StagePlan::from_physical_plan(
-                    query_id,
-                    StageId(0),
-                    Vec::new(),
-                    partition_count,
-                    aggregate.worker_plan(),
-                )?;
-                let result = RemoteStageRunner::new(remote)?
-                    .execute(stage, cancellation.clone())
-                    .await?;
-                cancellation.check()?;
-                let partial_bytes = result
-                    .batches
-                    .iter()
-                    .map(|batch| batch.get_array_memory_size() as u64)
-                    .sum();
-                let _partial_reservation = memory.try_reserve(partial_bytes)?;
-                let merge_started = Instant::now();
-                let batch = aggregate.merge(&result.batches, &memory)?;
-                metrics.record_operator_output(
-                    aggregate.operator_id(),
-                    "HashAggregate",
-                    batch.num_rows(),
-                );
-                metrics.add_operator_elapsed(
-                    aggregate.operator_id(),
-                    "HashAggregate",
-                    merge_started.elapsed(),
-                );
-                (
-                    vec![batch],
-                    result.output_blocks,
-                    result.cleanup_errors,
-                    partition_count,
-                    2,
+        let (batches, metric_blocks, cleanup_errors, task_count, stages) = if let Some(aggregate) =
+            aggregate
+        {
+            let partition_count = remote_partition_count_from_usize(aggregate.partition_count())?;
+            let partial_stage_id = StageId(0);
+            let final_stage_id = StageId(1);
+            let partial_stage = StagePlan::from_physical_plan(
+                query_id.clone(),
+                partial_stage_id,
+                Vec::new(),
+                partition_count,
+                aggregate.worker_plan(),
+            )?;
+            let final_plan = aggregate.final_worker_plan(partial_stage_id)?;
+            let final_stage = StagePlan::from_physical_plan(
+                query_id,
+                final_stage_id,
+                vec![partial_stage_id],
+                1,
+                final_plan.as_ref(),
+            )?;
+            let result = RemoteStageRunner::new(remote)?
+                .execute_graph(
+                    vec![partial_stage, final_stage],
+                    final_stage_id,
+                    cancellation,
                 )
-            } else {
-                let partition_count = remote_partition_count(physical.as_ref())?;
-                let stage = StagePlan::from_physical_plan(
-                    query_id,
-                    StageId(0),
-                    Vec::new(),
-                    partition_count,
-                    physical.as_ref(),
-                )?;
-                let result = RemoteStageRunner::new(remote)?
-                    .execute(stage, cancellation)
-                    .await?;
-                (
-                    result.batches,
-                    result.output_blocks,
-                    result.cleanup_errors,
-                    partition_count,
-                    1,
-                )
-            };
+                .await?;
+            let task_count = partition_count
+                .checked_add(1)
+                .ok_or_else(|| SparkXError::execution("remote aggregate task count overflowed"))?;
+            (
+                result.batches,
+                result.intermediate_blocks,
+                result.cleanup_errors,
+                task_count,
+                2,
+            )
+        } else {
+            let partition_count = remote_partition_count(physical.as_ref())?;
+            let stage = StagePlan::from_physical_plan(
+                query_id,
+                StageId(0),
+                Vec::new(),
+                partition_count,
+                physical.as_ref(),
+            )?;
+            let result = RemoteStageRunner::new(remote)?
+                .execute(stage, cancellation)
+                .await?;
+            (
+                result.batches,
+                result.output_blocks,
+                result.cleanup_errors,
+                partition_count,
+                1,
+            )
+        };
         for batch in &batches {
             metrics.record_output(batch.num_rows());
         }
-        let shuffled_rows = output_blocks.iter().try_fold(0_usize, |total, block| {
+        let shuffled_rows = metric_blocks.iter().try_fold(0_usize, |total, block| {
             let rows = usize::try_from(block.rows).map_err(|_| {
                 SparkXError::execution("remote output row count exceeds the local platform limit")
             })?;
@@ -264,12 +261,11 @@ impl Session {
             })
         })?;
         metrics.add_shuffled_rows(shuffled_rows);
-        metrics.add_shuffled_bytes(output_blocks.iter().map(|block| block.bytes).sum());
-        for _ in 0..partition_count {
+        metrics.add_shuffled_bytes(metric_blocks.iter().map(|block| block.bytes).sum());
+        for _ in 0..task_count {
             metrics.add_task();
         }
         metrics.set_elapsed(started.elapsed());
-        metrics.set_memory_usage(memory.reserved_bytes(), memory.peak_bytes());
         Ok(QueryResult {
             batches,
             metrics: metrics.snapshot(),

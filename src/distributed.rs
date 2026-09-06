@@ -1,22 +1,21 @@
-//! In-process distributed runner.
+//! Distributed plan splitting and the in-process cluster runner.
 //!
-//! It schedules partition tasks through the coordinator state machine, produces Arrow partial
-//! aggregates, sends them through a query-scoped loopback Arrow Flight exchange, and merges them.
-//! Workers consume serialized stage plans and report protocol task updates; moving execution
-//! off-process still requires remote transport and task RPC handlers.
+//! `LocalCluster` exercises coordinator scheduling and a loopback Arrow Flight exchange in one
+//! process. The aggregate splitter also produces the partial and final physical fragments used by
+//! standalone remote workers.
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, MemoryTable, TableRef};
 use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::error::{Result, SparkXError};
 use crate::execution::{
     OperatorId, PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
 };
-use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
+use crate::expr::{AggregateFunction, Expr, Operator, ScalarValue, scalars_to_array, value_at};
 use crate::flight_exchange::{LoopbackFlightExchange, ShuffleExchange};
 use crate::memory::QueryMemory;
 use crate::protocol::{
     CoordinatorMessage, PROTOCOL_VERSION, QueryId, StageId, StagePlan, TaskState, WorkerId,
-    WorkerMessage, WorkerRegistration,
+    WorkerMessage, WorkerRegistration, stage_input_table_name,
 };
 use crate::row_key::{EncodedKey, RowKeyEncoder, encoded_key_memory_bytes};
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -63,23 +62,127 @@ impl PartialAggregatePlan {
         self.partition_count
     }
 
-    pub(crate) fn operator_id(&self) -> OperatorId {
-        self.operator_id
-    }
+    pub(crate) fn final_worker_plan(&self, input_stage: StageId) -> Result<Arc<PhysicalPlan>> {
+        let input_schema = self.worker_plan.schema();
+        let provider: TableRef =
+            Arc::new(MemoryTable::new(input_schema.clone(), vec![Vec::new()])?);
+        let scan = Arc::new(PhysicalPlan::Scan {
+            id: self.operator_id.saturating_add(2),
+            table_name: stage_input_table_name(input_stage),
+            provider,
+            projection: None,
+            filters: Vec::new(),
+            schema: input_schema.clone(),
+        });
+        let merge_groups = input_schema
+            .fields()
+            .iter()
+            .take(self.group_count)
+            .map(|field| Expr::column(field.name()))
+            .collect::<Vec<_>>();
+        let mut merge_exprs = Vec::new();
+        let mut projection_exprs = input_schema
+            .fields()
+            .iter()
+            .take(self.group_count)
+            .zip(self.output_schema.fields().iter())
+            .map(|(input, output)| Expr::column(input.name()).alias(output.name()))
+            .collect::<Vec<_>>();
+        let mut partial_column = self.group_count;
 
-    pub(crate) fn merge(
-        &self,
-        batches: &[RecordBatch],
-        memory: &QueryMemory,
-    ) -> Result<RecordBatch> {
-        merge_partials(
-            batches,
-            self.group_count,
-            &self.aggregate_exprs,
-            self.output_schema.clone(),
-            memory,
-        )
+        for (index, aggregate) in self.aggregate_exprs.iter().enumerate() {
+            let Expr::Aggregate { function, .. } = aggregate.unalias() else {
+                return Err(SparkXError::planning(format!(
+                    "expected aggregate expression, got {aggregate}"
+                )));
+            };
+            let output_name = self.output_schema.field(self.group_count + index).name();
+            let partial_name = input_schema.field(partial_column).name();
+            let merge_name = format!("__sparkx_merge_{index}");
+            match function {
+                AggregateFunction::Count => {
+                    merge_exprs.push(aggregate_column(
+                        AggregateFunction::SumUInt64,
+                        partial_name,
+                        &merge_name,
+                    ));
+                    projection_exprs.push(Expr::column(&merge_name).alias(output_name));
+                    partial_column += 1;
+                }
+                AggregateFunction::Sum => {
+                    merge_exprs.push(aggregate_column(
+                        AggregateFunction::Sum,
+                        partial_name,
+                        &merge_name,
+                    ));
+                    projection_exprs.push(Expr::column(&merge_name).alias(output_name));
+                    partial_column += 1;
+                }
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    merge_exprs.push(aggregate_column(*function, partial_name, &merge_name));
+                    projection_exprs.push(Expr::column(&merge_name).alias(output_name));
+                    partial_column += 1;
+                }
+                AggregateFunction::Avg => {
+                    let count_name = input_schema.field(partial_column + 1).name();
+                    let sum_merge_name = format!("__sparkx_merge_avg_sum_{index}");
+                    let count_merge_name = format!("__sparkx_merge_avg_count_{index}");
+                    merge_exprs.push(aggregate_column(
+                        AggregateFunction::Sum,
+                        partial_name,
+                        &sum_merge_name,
+                    ));
+                    merge_exprs.push(aggregate_column(
+                        AggregateFunction::SumUInt64,
+                        count_name,
+                        &count_merge_name,
+                    ));
+                    projection_exprs.push(
+                        Expr::binary(
+                            Expr::column(&sum_merge_name),
+                            Operator::Divide,
+                            Expr::column(&count_merge_name),
+                        )
+                        .alias(output_name),
+                    );
+                    partial_column += 2;
+                }
+                AggregateFunction::SumUInt64 => {
+                    merge_exprs.push(aggregate_column(
+                        AggregateFunction::SumUInt64,
+                        partial_name,
+                        &merge_name,
+                    ));
+                    projection_exprs.push(Expr::column(&merge_name).alias(output_name));
+                    partial_column += 1;
+                }
+            }
+        }
+
+        let merge_schema = aggregate_schema(input_schema, &merge_groups, &merge_exprs)?;
+        let merge = Arc::new(PhysicalPlan::HashAggregate {
+            id: self.operator_id.saturating_add(1),
+            input: scan,
+            group_exprs: merge_groups,
+            aggregate_exprs: merge_exprs,
+            schema: merge_schema,
+        });
+        Ok(Arc::new(PhysicalPlan::Projection {
+            id: self.operator_id,
+            input: merge,
+            exprs: projection_exprs,
+            schema: self.output_schema.clone(),
+        }))
     }
+}
+
+fn aggregate_column(function: AggregateFunction, column: &str, alias: &str) -> Expr {
+    Expr::Aggregate {
+        function,
+        expr: Box::new(Expr::column(column)),
+        distinct: false,
+    }
+    .alias(alias)
 }
 
 /// Splits a top-level, non-distinct hash aggregate into partition-local and final phases.
@@ -507,6 +610,14 @@ fn merge_partials(
                         }
                         column += 1;
                     }
+                    (AggregateFunction::SumUInt64, MergeState::Count(total)) => {
+                        *total = total
+                            .checked_add(as_u64(&value_at(batch.column(column).as_ref(), row)?)?)
+                            .ok_or_else(|| {
+                                SparkXError::execution("partial unsigned sum overflowed UInt64")
+                            })?;
+                        column += 1;
+                    }
                     (AggregateFunction::Min, MergeState::Min(current)) => {
                         merge_extreme(
                             current,
@@ -590,6 +701,7 @@ fn new_merge_states(functions: &[AggregateFunction]) -> Vec<MergeState> {
                 value: 0.0,
                 seen: false,
             },
+            AggregateFunction::SumUInt64 => MergeState::Count(0),
             AggregateFunction::Min => MergeState::Min(None),
             AggregateFunction::Max => MergeState::Max(None),
             AggregateFunction::Avg => MergeState::Avg { sum: 0.0, count: 0 },

@@ -234,10 +234,12 @@ consistent Arrow schema, and only then performs best-effort deletion. It deliber
 to fragment or merge an arbitrary SQL physical plan. `Session::execute_sql_remote` uses the runner for
 the semantics-preserving partition-local subset (`Scan`, `Filter`, and `Projection`). For a top-level,
 non-distinct aggregate over a join-free input, the session replaces the worker fragment with a partial
-aggregate, executes one remote task per scan partition, and merges the returned states in the driver
-under the query memory budget. `AVG` crosses the boundary as a `SUM` and `COUNT` pair. This is a real
-two-stage execution path, but the second stage is not remotely scheduled yet. Joins, distinct
-aggregates, sort, and limit still require repartitioning or broader stage-graph planning.
+aggregate and submits a dependent final-merge stage. Each final-stage assignment carries the
+successful partial-block manifests. The assigned worker fetches those blocks directly from their
+producer Flight endpoints, accounts the materialized batches against its shared query memory, mounts
+them in a task-local catalog, and executes a normal hash-aggregate/projection fragment. `AVG` crosses
+the boundary as a `SUM` and `COUNT` pair. Joins, distinct aggregates, sort, and limit still require
+repartitioning or broader exchange planning.
 
 `sparkx-coordinator` hosts the same state and Flight service in a standalone process with configurable
 bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. The local
@@ -305,10 +307,10 @@ flowchart LR
 ```
 
 Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
-processes, a bounded worker-hosted Flight output sink, partition-local remote SQL, and remote worker
-partials with a driver-side aggregate merge now exist. The next step is to schedule the final merge as
-a dependent remote stage and repartition intermediate blocks; durable/object-store shuffle follows
-that integration.
+processes, a bounded worker-hosted Flight output sink, partition-local remote SQL, and two-stage
+remote aggregation with worker-to-worker Flight reads now exist. The next step is to repartition
+intermediate blocks for parallel downstream stages; durable/object-store shuffle follows that
+integration.
 
 ## Non-goals for version 0.1
 

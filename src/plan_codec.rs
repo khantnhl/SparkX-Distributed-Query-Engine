@@ -14,7 +14,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub const PLAN_CODEC_VERSION: u32 = 1;
+pub const PLAN_CODEC_VERSION: u32 = 2;
 pub const MAX_PLAN_FRAGMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLAN_DEPTH: usize = 128;
 
@@ -938,6 +938,7 @@ fn encode_aggregate_function(function: AggregateFunction) -> WireAggregateFuncti
     match function {
         AggregateFunction::Count => WireAggregateFunction::Count,
         AggregateFunction::Sum => WireAggregateFunction::Sum,
+        AggregateFunction::SumUInt64 => WireAggregateFunction::SumUInt64,
         AggregateFunction::Min => WireAggregateFunction::Min,
         AggregateFunction::Max => WireAggregateFunction::Max,
         AggregateFunction::Avg => WireAggregateFunction::Avg,
@@ -951,6 +952,7 @@ fn decode_aggregate_function(value: i32) -> Result<AggregateFunction> {
         {
             WireAggregateFunction::Count => AggregateFunction::Count,
             WireAggregateFunction::Sum => AggregateFunction::Sum,
+            WireAggregateFunction::SumUInt64 => AggregateFunction::SumUInt64,
             WireAggregateFunction::Min => AggregateFunction::Min,
             WireAggregateFunction::Max => AggregateFunction::Max,
             WireAggregateFunction::Avg => AggregateFunction::Avg,
@@ -1295,6 +1297,7 @@ enum WireAggregateFunction {
     Min = 2,
     Max = 3,
     Avg = 4,
+    SumUInt64 = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]

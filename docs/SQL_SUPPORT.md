@@ -77,10 +77,11 @@ The standalone-process remote runner supports a physical `Scan` with any chain o
 `Filter` and `Projection` operators, executes one task per CSV/memory/Parquet partition, and
 concatenates verified Flight output blocks. It also splits a top-level, non-distinct hash aggregate
 over a join-free input: workers compute partial states for each scan partition, including `SUM` and
-`COUNT` state pairs for `AVG`, and the driver performs a memory-accounted final merge. Remote joins,
-distinct aggregates, `ORDER BY`, and `LIMIT` are rejected before submission because they require
-repartitioning or a broader stage graph. The planning session and remote workers must register
-matching table names and schemas.
+`COUNT` state pairs for `AVG`, publish them through their Flight data planes, and a dependent worker
+fetches the immutable blocks and performs the final merge. Remote joins, distinct aggregates,
+`ORDER BY`, and `LIMIT` are rejected before submission because they require repartitioning or broader
+exchange planning. The planning session and remote workers must register matching table names and
+schemas.
 
 ## Verification
 

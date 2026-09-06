@@ -325,7 +325,7 @@ async fn session_executes_two_stage_remote_aggregate() {
     let coordinator = Arc::new(Mutex::new(
         Coordinator::new(CoordinatorConfig::default()).unwrap(),
     ));
-    let server = ControlPlaneServer::start_loopback(coordinator)
+    let server = ControlPlaneServer::start_loopback(coordinator.clone())
         .await
         .unwrap();
     let table = Arc::new(
@@ -358,10 +358,11 @@ async fn session_executes_two_stage_remote_aggregate() {
     remote.poll_interval = Duration::from_millis(5);
     remote.timeout = Duration::from_secs(5);
 
+    let query_id = QueryId::new("query-session-aggregate").unwrap();
     let result = session
         .execute_sql_remote(
             "SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue, AVG(amount) AS average, MIN(amount) AS minimum, MAX(amount) AS maximum FROM sales WHERE amount > 10 GROUP BY region",
-            QueryId::new("query-session-aggregate").unwrap(),
+            query_id.clone(),
             remote,
         )
         .await
@@ -418,12 +419,35 @@ async fn session_executes_two_stage_remote_aggregate() {
     assert!(rows.is_empty());
     assert!(result.distributed);
     assert_eq!(result.stages, 2);
-    assert_eq!(result.metrics.tasks, 4);
+    assert_eq!(result.metrics.tasks, 5);
     assert_eq!(result.metrics.output_rows, 2);
     assert_eq!(result.metrics.shuffled_rows, 4);
     assert!(result.metrics.shuffled_bytes > 0);
-    assert!(result.metrics.memory_peak_bytes > 0);
     assert!(result.cleanup_errors.is_empty());
+
+    let cleaned_blocks = {
+        let coordinator = coordinator.lock().await;
+        let mut blocks = coordinator
+            .stage_output_blocks(&query_id, StageId(0))
+            .unwrap();
+        blocks.extend(
+            coordinator
+                .stage_output_blocks(&query_id, StageId(1))
+                .unwrap(),
+        );
+        blocks
+    };
+    for block in cleaned_blocks {
+        let endpoint = match &block.location {
+            ShuffleLocation::Flight { endpoint, .. } => endpoint,
+            other => panic!("expected Flight output, got {other:?}"),
+        };
+        let mut client = FlightDataPlaneClient::connect(endpoint).await.unwrap();
+        assert!(matches!(
+            client.download(&block).await.unwrap_err(),
+            SparkXError::NotFound(_)
+        ));
+    }
 
     shutdown.cancel();
     for handle in worker_handles {

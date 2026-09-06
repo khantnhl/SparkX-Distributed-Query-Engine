@@ -8,7 +8,7 @@ use crate::protocol::{PartitionId, ShuffleBlock, ShuffleLocation, StagePlan};
 use crate::{Result, SparkXError};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -49,7 +49,10 @@ impl RemoteStageConfig {
 pub struct RemoteStageResult {
     pub schema: Option<SchemaRef>,
     pub batches: Vec<RecordBatch>,
+    /// Blocks produced by the final stage and fetched into `batches`.
     pub output_blocks: Vec<ShuffleBlock>,
+    /// Blocks consumed between remote stages.
+    pub intermediate_blocks: Vec<ShuffleBlock>,
     /// Cleanup is best-effort after every block has been fetched and verified.
     pub cleanup_errors: Vec<String>,
 }
@@ -75,14 +78,58 @@ impl RemoteStageRunner {
         stage: StagePlan,
         cancellation: CancellationToken,
     ) -> Result<RemoteStageResult> {
+        let final_stage_id = stage.stage_id;
+        self.execute_graph(vec![stage], final_stage_id, cancellation)
+            .await
+    }
+
+    pub async fn execute_graph(
+        &self,
+        stages: Vec<StagePlan>,
+        final_stage_id: crate::protocol::StageId,
+        cancellation: CancellationToken,
+    ) -> Result<RemoteStageResult> {
         cancellation.check()?;
-        stage.validate()?;
-        let query_id = stage.query_id.clone();
-        let stage_id = stage.stage_id;
-        let partition_count = stage.partition_count;
+        let query_id = stages
+            .first()
+            .map(|stage| stage.query_id.clone())
+            .ok_or_else(|| SparkXError::planning("remote stage graph must not be empty"))?;
+        let mut submitted = BTreeSet::new();
+        for stage in &stages {
+            stage.validate()?;
+            if stage.query_id != query_id {
+                return Err(SparkXError::planning(
+                    "remote stage graph contains more than one query ID",
+                ));
+            }
+            if stage
+                .input_stages
+                .iter()
+                .any(|dependency| !submitted.contains(dependency))
+            {
+                return Err(SparkXError::planning(format!(
+                    "remote stage {} appears before one of its dependencies",
+                    stage.stage_id.0
+                )));
+            }
+            if !submitted.insert(stage.stage_id) {
+                return Err(SparkXError::planning(format!(
+                    "remote stage graph contains duplicate stage {}",
+                    stage.stage_id.0
+                )));
+            }
+        }
+        if !submitted.contains(&final_stage_id) {
+            return Err(SparkXError::planning(format!(
+                "remote final stage {} is not present in the graph",
+                final_stage_id.0
+            )));
+        }
         let mut control =
             ControlPlaneClient::connect(self.config.coordinator_endpoint.clone()).await?;
-        control.submit_stage(&stage).await?;
+        for stage in &stages {
+            control.submit_stage(stage).await?;
+        }
         let started = Instant::now();
 
         loop {
@@ -92,38 +139,60 @@ impl RemoteStageRunner {
                     .await;
                 return Err(SparkXError::Cancelled);
             }
-            match control.stage_status(query_id.clone(), stage_id).await? {
-                StageStatus::Succeeded => {
-                    let blocks = control
-                        .stage_output_blocks(query_id.clone(), stage_id)
+            let mut all_succeeded = true;
+            for stage in &stages {
+                match control
+                    .stage_status(query_id.clone(), stage.stage_id)
+                    .await?
+                {
+                    StageStatus::Succeeded => {}
+                    StageStatus::Failed => {
+                        let details = failed_partition_details(
+                            &mut control,
+                            &query_id,
+                            stage.stage_id,
+                            stage.partition_count,
+                        )
                         .await?;
-                    return self.fetch_output(blocks).await;
+                        return Err(SparkXError::execution(format!(
+                            "remote query {} stage {} failed{details}",
+                            query_id.as_str(),
+                            stage.stage_id.0
+                        )));
+                    }
+                    StageStatus::Cancelled => return Err(SparkXError::Cancelled),
+                    StageStatus::Blocked | StageStatus::Ready | StageStatus::Running => {
+                        all_succeeded = false;
+                    }
                 }
-                StageStatus::Failed => {
-                    let details = failed_partition_details(
-                        &mut control,
-                        &query_id,
-                        stage_id,
-                        partition_count,
-                    )
-                    .await?;
-                    return Err(SparkXError::execution(format!(
-                        "remote query {} stage {} failed{details}",
-                        query_id.as_str(),
-                        stage_id.0
-                    )));
+            }
+            if all_succeeded {
+                let mut output_blocks = Vec::new();
+                let mut intermediate_blocks = Vec::new();
+                for stage in &stages {
+                    let blocks = control
+                        .stage_output_blocks(query_id.clone(), stage.stage_id)
+                        .await?;
+                    if stage.stage_id == final_stage_id {
+                        output_blocks = blocks;
+                    } else {
+                        intermediate_blocks.extend(blocks);
+                    }
                 }
-                StageStatus::Cancelled => return Err(SparkXError::Cancelled),
-                StageStatus::Blocked | StageStatus::Ready | StageStatus::Running => {}
+                let mut cleanup_blocks = intermediate_blocks.clone();
+                cleanup_blocks.extend(output_blocks.iter().cloned());
+                return self
+                    .fetch_output(output_blocks, intermediate_blocks, cleanup_blocks)
+                    .await;
             }
             if started.elapsed() >= self.config.timeout {
                 let _ = control
                     .cancel_query(query_id.clone(), "remote stage timed out")
                     .await;
                 return Err(SparkXError::execution(format!(
-                    "remote query {} stage {} exceeded its {:?} timeout",
+                    "remote query {} graph ending at stage {} exceeded its {:?} timeout",
                     query_id.as_str(),
-                    stage_id.0,
+                    final_stage_id.0,
                     self.config.timeout
                 )));
             }
@@ -139,7 +208,12 @@ impl RemoteStageRunner {
         }
     }
 
-    async fn fetch_output(&self, blocks: Vec<ShuffleBlock>) -> Result<RemoteStageResult> {
+    async fn fetch_output(
+        &self,
+        blocks: Vec<ShuffleBlock>,
+        intermediate_blocks: Vec<ShuffleBlock>,
+        cleanup_blocks: Vec<ShuffleBlock>,
+    ) -> Result<RemoteStageResult> {
         let mut clients = BTreeMap::<String, FlightDataPlaneClient>::new();
         let mut schema = None::<SchemaRef>;
         let mut batches = Vec::new();
@@ -162,11 +236,22 @@ impl RemoteStageRunner {
 
         let mut cleanup_errors = Vec::new();
         if self.config.delete_output_after_fetch {
-            for block in &blocks {
-                let endpoint = flight_endpoint(block)?;
+            for block in &cleanup_blocks {
+                let endpoint = flight_endpoint(block)?.to_owned();
+                if !clients.contains_key(&endpoint) {
+                    match FlightDataPlaneClient::connect(endpoint.clone()).await {
+                        Ok(client) => {
+                            clients.insert(endpoint.clone(), client);
+                        }
+                        Err(error) => {
+                            cleanup_errors.push(error.to_string());
+                            continue;
+                        }
+                    }
+                }
                 if let Err(error) = clients
-                    .get_mut(endpoint)
-                    .expect("downloaded block must have a data-plane client")
+                    .get_mut(&endpoint)
+                    .expect("cleanup block must have a data-plane client")
                     .delete(block)
                     .await
                 {
@@ -178,6 +263,7 @@ impl RemoteStageRunner {
             schema,
             batches,
             output_blocks: blocks,
+            intermediate_blocks,
             cleanup_errors,
         })
     }

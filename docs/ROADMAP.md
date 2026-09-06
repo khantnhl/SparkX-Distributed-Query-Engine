@@ -95,9 +95,10 @@ behind Flight `DoPut`/`DoGet`, report owner/endpoint/ticket/checksum manifests, 
 download and explicit deletion. A driver-side runner now submits one pre-fragmented stage, observes
 stage/partition status, propagates timeout/cancellation, and collects verified output. Session-level
 partition-local scan/filter/projection SQL now uses that runner. Top-level non-distinct aggregates
-over join-free inputs execute partition-local partial states on remote workers and merge in the
-driver under the query memory budget. Remote dependent-stage scheduling, repartitioned exchange,
-and durable shuffle remain open.
+over join-free inputs now form a two-stage remote graph: first-stage workers publish partial states,
+the coordinator supplies their manifests to a dependent task, and the final worker fetches them over
+Flight into bounded query memory before merging. Repartitioned exchange and durable shuffle remain
+open.
 
 Split the current `LocalCluster` seam into:
 

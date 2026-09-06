@@ -1,8 +1,9 @@
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sparkx::catalog::{Catalog, MemoryTable};
 use sparkx::execution::{PhysicalPlan, TaskContext, execute};
+use sparkx::expr::{AggregateFunction, Expr, ScalarValue, value_at};
 use sparkx::metrics::QueryMetrics;
 use sparkx::optimizer::Optimizer;
 use sparkx::plan_codec::{MAX_PLAN_FRAGMENT_BYTES, PhysicalPlanCodec};
@@ -96,6 +97,58 @@ async fn round_trips_and_executes_every_physical_operator_shape() {
             "query: {sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn unsigned_merge_sum_stays_exact_above_f64_integer_precision() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "partial_count",
+        DataType::UInt64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt64Array::from(vec![9_007_199_254_740_992, 1])) as ArrayRef],
+    )
+    .unwrap();
+    let provider = Arc::new(MemoryTable::new(schema.clone(), vec![vec![batch]]).unwrap());
+    let catalog = Catalog::default();
+    catalog.register("partial_counts", provider.clone());
+    let scan = Arc::new(PhysicalPlan::Scan {
+        id: 1,
+        table_name: "partial_counts".to_owned(),
+        provider,
+        projection: None,
+        filters: Vec::new(),
+        schema: schema.clone(),
+    });
+    let aggregate_expr = Expr::Aggregate {
+        function: AggregateFunction::SumUInt64,
+        expr: Box::new(Expr::column("partial_count")),
+        distinct: false,
+    }
+    .alias("total");
+    let output_schema = Arc::new(Schema::new(vec![Field::new(
+        "total",
+        DataType::UInt64,
+        true,
+    )]));
+    let plan = PhysicalPlan::HashAggregate {
+        id: 0,
+        input: scan,
+        group_exprs: Vec::new(),
+        aggregate_exprs: vec![aggregate_expr],
+        schema: output_schema,
+    };
+
+    let encoded = PhysicalPlanCodec::encode(&plan).unwrap();
+    let decoded = PhysicalPlanCodec::decode(&encoded, &catalog).unwrap();
+    let batches = execute_plan(decoded).await;
+
+    assert_eq!(
+        value_at(batches[0].column(0).as_ref(), 0).unwrap(),
+        ScalarValue::UInt64(9_007_199_254_740_993)
+    );
 }
 
 #[test]
