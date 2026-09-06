@@ -73,11 +73,14 @@ loopback Arrow Flight/gRPC exchange before the final merge.
 CSV files expose one partition. Memory tables can contain multiple explicit partitions, and each
 Parquet row group is a partition.
 
-The standalone-process remote runner has a narrower, explicit boundary. It supports a physical
-`Scan` with any chain of partition-local `Filter` and `Projection` operators, executes one task per
-CSV/memory/Parquet partition, and concatenates verified Flight output blocks. Aggregates, joins,
-`ORDER BY`, and `LIMIT` are rejected before stage submission because they require a global merge or
-exchange. The planning session and remote workers must register matching table names and schemas.
+The standalone-process remote runner supports a physical `Scan` with any chain of partition-local
+`Filter` and `Projection` operators, executes one task per CSV/memory/Parquet partition, and
+concatenates verified Flight output blocks. It also splits a top-level, non-distinct hash aggregate
+over a join-free input: workers compute partial states for each scan partition, including `SUM` and
+`COUNT` state pairs for `AVG`, and the driver performs a memory-accounted final merge. Remote joins,
+distinct aggregates, `ORDER BY`, and `LIMIT` are rejected before submission because they require
+repartitioning or a broader stage graph. The planning session and remote workers must register
+matching table names and schemas.
 
 ## Verification
 

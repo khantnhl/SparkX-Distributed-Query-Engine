@@ -225,13 +225,17 @@ delete consumed blocks. The store accounts retained Arrow bytes against a fixed 
 oversized streaming upload while decoding it, and preserves schemas for empty results. It is an
 in-memory, worker-lifetime result sink—not durable shuffle—and currently has no authentication or TLS.
 
-`RemoteStageRunner` is the first driver-side consumer of these services. It submits one prebuilt
+`RemoteStageRunner` is the driver-side consumer of these services. It submits one prebuilt
 `StagePlan`, polls explicit stage status, expands terminal failures with per-partition attempt errors,
 propagates cancellation and timeout to the coordinator, downloads every output block, verifies a
 consistent Arrow schema, and only then performs best-effort deletion. It deliberately does not claim
 to fragment or merge an arbitrary SQL physical plan. `Session::execute_sql_remote` uses the runner for
-the semantics-preserving partition-local subset (`Scan`, `Filter`, and `Projection`) and rejects every
-global operator before submission. Aggregation, join, sort, and limit require multi-stage merge planning.
+the semantics-preserving partition-local subset (`Scan`, `Filter`, and `Projection`). For a top-level,
+non-distinct aggregate over a join-free input, the session replaces the worker fragment with a partial
+aggregate, executes one remote task per scan partition, and merges the returned states in the driver
+under the query memory budget. `AVG` crosses the boundary as a `SUM` and `COUNT` pair. This is a real
+two-stage execution path, but the second stage is not remotely scheduled yet. Joins, distinct
+aggregates, sort, and limit still require repartitioning or broader stage-graph planning.
 
 `sparkx-coordinator` hosts the same state and Flight service in a standalone process with configurable
 bind address, lease duration, heartbeat timeout, attempt limit, and stage-partition limit. The local
@@ -299,9 +303,10 @@ flowchart LR
 ```
 
 Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
-processes, a bounded worker-hosted Flight output sink, a single-stage remote driver, and partition-local
-remote SQL now exist. The next step is to make `Session` fragment and submit global stage graphs, merge partial results, and repartition intermediate
-blocks; durable/object-store shuffle follows that integration.
+processes, a bounded worker-hosted Flight output sink, partition-local remote SQL, and remote worker
+partials with a driver-side aggregate merge now exist. The next step is to schedule the final merge as
+a dependent remote stage and repartition intermediate blocks; durable/object-store shuffle follows
+that integration.
 
 ## Non-goals for version 0.1
 

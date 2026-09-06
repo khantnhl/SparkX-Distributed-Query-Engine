@@ -49,6 +49,7 @@ their assigned partitions, and publish Arrow output blocks for the client to ret
 - Query-scoped memory reservations for blocking operators
 - Native hash aggregation, hash joins, sorting, and limited-sort Top-K
 - Two-stage in-process distributed aggregation with partial and final merging
+- Two-stage remote aggregation with worker partials and a memory-accounted driver merge
 - Versioned Protobuf physical-plan fragments with worker-side schema validation
 - Coordinator-managed workers, slots, heartbeats, leases, attempts, retries, and cancellation
 - Standalone coordinator and worker processes connected through Arrow Flight/gRPC
@@ -65,10 +66,12 @@ See [SQL support](docs/SQL_SUPPORT.md) for the precise language and type boundar
 |---|---|---|
 | Native | default | One process executes the physical plan |
 | Local distributed | `--distributed --workers N` | One process runs logical workers and a two-stage aggregate path |
-| Remote | `--remote-coordinator URL` | Separate client, coordinator, and worker processes execute one partition-local stage |
+| Remote | `--remote-coordinator URL` | Separate processes execute partition-local plans or mergeable two-stage aggregates |
 
-Remote SQL currently supports `Scan`, `Filter`, and `Projection`. Aggregates, joins, sorts, and
-limits require global merging or repartitioning, so remote mode rejects those plans before submission.
+Remote SQL supports `Scan`, `Filter`, and `Projection`, plus a top-level non-distinct aggregate over
+a join-free input. Workers compute partition-local aggregate states and the driver performs the
+memory-accounted final merge. Joins, sorting, limits, and distinct aggregates still require broader
+stage-graph or exchange planning and are rejected before submission.
 
 ## Quick start
 
@@ -163,6 +166,18 @@ cargo run --bin sparkx -- \
   --metrics
 ```
 
+Or run a mergeable aggregate. Each worker produces partial aggregate states, and the client merges
+the verified states into the final result:
+
+```bash
+cargo run --bin sparkx -- \
+  --input ./sales.parquet \
+  --table sales \
+  --sql "SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue FROM sales GROUP BY region" \
+  --remote-coordinator http://127.0.0.1:50051 \
+  --metrics
+```
+
 By default, the worker serves output on an ephemeral loopback port. For another machine to retrieve
 the output, bind a reachable interface and advertise the worker's DNS name or IP:
 
@@ -206,8 +221,8 @@ metadata alongside the reports.
 
 ## Current limitations
 
-- Remote execution supports only partition-local scans, filters, and projections.
-- Remote global aggregation, joins, sorting, and limits do not yet have exchange and merge stages.
+- Remote aggregation merges worker partials in the driver rather than a downstream worker stage.
+- Remote joins, sorting, limits, and distinct aggregates do not yet have exchange and merge stages.
 - Worker output is memory-only and is lost when the worker exits.
 - The coordinator does not persist state or recover after restart.
 - Authentication, authorization, and TLS are not implemented.

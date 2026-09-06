@@ -1,6 +1,6 @@
 use crate::cancellation::CancellationToken;
 use crate::catalog::{Catalog, CsvTable, MemoryTable, ParquetTable, TableRef};
-use crate::distributed::LocalCluster;
+use crate::distributed::{LocalCluster, split_mergeable_aggregate};
 use crate::error::{Result, SparkXError};
 use crate::execution::{TaskContext, execute};
 use crate::expr::{AggregateFunction, Expr, Operator, ScalarValue};
@@ -188,37 +188,97 @@ impl Session {
         let optimized_text = optimized.explain();
         let physical = PhysicalPlanner::create_physical_plan(&optimized, &self.catalog)?;
         let physical_text = physical.explain();
-        let partition_count = remote_partition_count(physical.as_ref())?;
-        let stage = StagePlan::from_physical_plan(
-            query_id,
-            StageId(0),
-            Vec::new(),
-            partition_count,
-            physical.as_ref(),
-        )?;
         let metrics = QueryMetrics::default();
+        let memory = QueryMemory::new(self.config.memory_limit_bytes);
         let started = Instant::now();
-        let result = RemoteStageRunner::new(remote)?
-            .execute(stage, cancellation)
-            .await?;
-        for batch in &result.batches {
+        let aggregate = split_mergeable_aggregate(physical.as_ref())?;
+        let (batches, output_blocks, cleanup_errors, partition_count, stages) =
+            if let Some(aggregate) = aggregate {
+                let partition_count =
+                    remote_partition_count_from_usize(aggregate.partition_count())?;
+                let stage = StagePlan::from_physical_plan(
+                    query_id,
+                    StageId(0),
+                    Vec::new(),
+                    partition_count,
+                    aggregate.worker_plan(),
+                )?;
+                let result = RemoteStageRunner::new(remote)?
+                    .execute(stage, cancellation.clone())
+                    .await?;
+                cancellation.check()?;
+                let partial_bytes = result
+                    .batches
+                    .iter()
+                    .map(|batch| batch.get_array_memory_size() as u64)
+                    .sum();
+                let _partial_reservation = memory.try_reserve(partial_bytes)?;
+                let merge_started = Instant::now();
+                let batch = aggregate.merge(&result.batches, &memory)?;
+                metrics.record_operator_output(
+                    aggregate.operator_id(),
+                    "HashAggregate",
+                    batch.num_rows(),
+                );
+                metrics.add_operator_elapsed(
+                    aggregate.operator_id(),
+                    "HashAggregate",
+                    merge_started.elapsed(),
+                );
+                (
+                    vec![batch],
+                    result.output_blocks,
+                    result.cleanup_errors,
+                    partition_count,
+                    2,
+                )
+            } else {
+                let partition_count = remote_partition_count(physical.as_ref())?;
+                let stage = StagePlan::from_physical_plan(
+                    query_id,
+                    StageId(0),
+                    Vec::new(),
+                    partition_count,
+                    physical.as_ref(),
+                )?;
+                let result = RemoteStageRunner::new(remote)?
+                    .execute(stage, cancellation)
+                    .await?;
+                (
+                    result.batches,
+                    result.output_blocks,
+                    result.cleanup_errors,
+                    partition_count,
+                    1,
+                )
+            };
+        for batch in &batches {
             metrics.record_output(batch.num_rows());
         }
-        metrics.add_shuffled_rows(result.row_count());
-        metrics.add_shuffled_bytes(result.output_blocks.iter().map(|block| block.bytes).sum());
+        let shuffled_rows = output_blocks.iter().try_fold(0_usize, |total, block| {
+            let rows = usize::try_from(block.rows).map_err(|_| {
+                SparkXError::execution("remote output row count exceeds the local platform limit")
+            })?;
+            total.checked_add(rows).ok_or_else(|| {
+                SparkXError::execution("remote output row count overflowed the local platform")
+            })
+        })?;
+        metrics.add_shuffled_rows(shuffled_rows);
+        metrics.add_shuffled_bytes(output_blocks.iter().map(|block| block.bytes).sum());
         for _ in 0..partition_count {
             metrics.add_task();
         }
         metrics.set_elapsed(started.elapsed());
+        metrics.set_memory_usage(memory.reserved_bytes(), memory.peak_bytes());
         Ok(QueryResult {
-            batches: result.batches,
+            batches,
             metrics: metrics.snapshot(),
             logical_plan: logical_text,
             optimized_plan: optimized_text,
             physical_plan: physical_text,
             distributed: true,
-            stages: 1,
-            cleanup_errors: result.cleanup_errors,
+            stages,
+            cleanup_errors,
         })
     }
 
@@ -586,10 +646,14 @@ fn remote_partition_count(plan: &crate::execution::PhysicalPlan) -> Result<u32> 
         }
         _ => {
             return Err(SparkXError::unsupported(
-                "remote SQL currently supports only partition-local Scan, Filter, and Projection plans; aggregates, joins, sorts, and limits require multi-stage merge planning",
+                "remote SQL supports partition-local Scan, Filter, and Projection plans plus top-level non-distinct aggregates over join-free inputs; this plan requires unsupported repartitioning or global stage planning",
             ));
         }
     };
+    remote_partition_count_from_usize(partitions)
+}
+
+fn remote_partition_count_from_usize(partitions: usize) -> Result<u32> {
     u32::try_from(partitions).map_err(|_| {
         SparkXError::planning(format!(
             "remote scan has {partitions} partitions, which exceeds the protocol limit"

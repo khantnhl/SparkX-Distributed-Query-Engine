@@ -1,4 +1,4 @@
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sparkx::catalog::{Catalog, MemoryTable, TableRef};
@@ -21,6 +21,28 @@ fn batch(values: Vec<i64>) -> RecordBatch {
         false,
     )]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef]).unwrap()
+}
+
+fn sales_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Float64, false),
+    ]))
+}
+
+fn sales_batch(rows: &[(&str, f64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        sales_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(region, _)| *region).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|(_, amount)| *amount).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap()
 }
 
 fn stage(query: &str, provider: TableRef, partitions: u32) -> StagePlan {
@@ -299,7 +321,119 @@ async fn session_executes_partition_local_sql_on_remote_workers() {
 }
 
 #[tokio::test]
-async fn session_rejects_global_remote_sql_before_submission() {
+async fn session_executes_two_stage_remote_aggregate() {
+    let coordinator = Arc::new(Mutex::new(
+        Coordinator::new(CoordinatorConfig::default()).unwrap(),
+    ));
+    let server = ControlPlaneServer::start_loopback(coordinator)
+        .await
+        .unwrap();
+    let table = Arc::new(
+        MemoryTable::new(
+            sales_schema(),
+            vec![
+                vec![sales_batch(&[("east", 10.0), ("east", 20.0)])],
+                vec![sales_batch(&[("west", 30.0)])],
+                vec![sales_batch(&[("east", 40.0), ("west", 50.0)])],
+                vec![sales_batch(&[("north", 5.0)])],
+            ],
+        )
+        .unwrap(),
+    );
+    let worker_catalog = Arc::new(Catalog::default());
+    worker_catalog.register("sales", table.clone());
+    let shutdown = CancellationToken::new();
+    let mut worker_handles = Vec::new();
+    for worker_id in ["worker-aggregate-a", "worker-aggregate-b"] {
+        let worker = RemoteWorker::new(
+            worker_config(server.endpoint(), worker_id, None),
+            worker_catalog.clone(),
+        )
+        .unwrap();
+        worker_handles.push(tokio::spawn(worker.run_until(shutdown.clone())));
+    }
+    let session = Session::new(SessionConfig::default());
+    session.register_table("sales", table);
+    let mut remote = RemoteStageConfig::new(server.endpoint());
+    remote.poll_interval = Duration::from_millis(5);
+    remote.timeout = Duration::from_secs(5);
+
+    let result = session
+        .execute_sql_remote(
+            "SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue, AVG(amount) AS average, MIN(amount) AS minimum, MAX(amount) AS maximum FROM sales WHERE amount > 10 GROUP BY region",
+            QueryId::new("query-session-aggregate").unwrap(),
+            remote,
+        )
+        .await
+        .unwrap();
+
+    let batch = &result.batches[0];
+    let regions = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let orders = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let revenue = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let average = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let minimum = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let maximum = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|row| {
+            (
+                regions.value(row).to_owned(),
+                (
+                    orders.value(row),
+                    revenue.value(row),
+                    average.value(row),
+                    minimum.value(row),
+                    maximum.value(row),
+                ),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(rows.remove("east"), Some((2, 60.0, 30.0, 20.0, 40.0)));
+    assert_eq!(rows.remove("west"), Some((2, 80.0, 40.0, 30.0, 50.0)));
+    assert!(rows.is_empty());
+    assert!(result.distributed);
+    assert_eq!(result.stages, 2);
+    assert_eq!(result.metrics.tasks, 4);
+    assert_eq!(result.metrics.output_rows, 2);
+    assert_eq!(result.metrics.shuffled_rows, 4);
+    assert!(result.metrics.shuffled_bytes > 0);
+    assert!(result.metrics.memory_peak_bytes > 0);
+    assert!(result.cleanup_errors.is_empty());
+
+    shutdown.cancel();
+    for handle in worker_handles {
+        handle.await.unwrap().unwrap();
+    }
+    server.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_rejects_unsupported_global_remote_sql_before_submission() {
     let session = Session::new(SessionConfig::default());
     session.register_memory(
         "input",
@@ -308,7 +442,7 @@ async fn session_rejects_global_remote_sql_before_submission() {
 
     let error = session
         .execute_sql_remote(
-            "SELECT COUNT(*) FROM input",
+            "SELECT value FROM input ORDER BY value",
             QueryId::new("query-global-rejected").unwrap(),
             RemoteStageConfig::new("http://127.0.0.1:9"),
         )
@@ -317,6 +451,20 @@ async fn session_rejects_global_remote_sql_before_submission() {
 
     assert!(matches!(
         error,
-        SparkXError::Unsupported(message) if message.contains("multi-stage merge planning")
+        SparkXError::Unsupported(message) if message.contains("unsupported repartitioning")
+    ));
+
+    let error = session
+        .execute_sql_remote(
+            "SELECT COUNT(DISTINCT value) FROM input",
+            QueryId::new("query-distinct-rejected").unwrap(),
+            RemoteStageConfig::new("http://127.0.0.1:9"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SparkXError::Unsupported(message) if message.contains("unsupported repartitioning")
     ));
 }

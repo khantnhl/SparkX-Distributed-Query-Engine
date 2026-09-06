@@ -9,7 +9,7 @@ use crate::catalog::Catalog;
 use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::error::{Result, SparkXError};
 use crate::execution::{
-    PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
+    OperatorId, PhysicalPlan, TaskContext, collect_with_memory, execute, hash_aggregate_with_memory,
 };
 use crate::expr::{AggregateFunction, Expr, ScalarValue, scalars_to_array, value_at};
 use crate::flight_exchange::{LoopbackFlightExchange, ShuffleExchange};
@@ -38,6 +38,96 @@ pub struct ClusterResult {
     pub batches: Vec<RecordBatch>,
     pub distributed: bool,
     pub stages: usize,
+}
+
+/// A mergeable aggregate split into one partition-local worker plan and one final merge.
+///
+/// The worker plan produces aggregate states rather than final values. In particular, `AVG`
+/// becomes a `SUM` and `COUNT` pair so the final merge remains correct across partitions.
+#[derive(Debug, Clone)]
+pub(crate) struct PartialAggregatePlan {
+    worker_plan: Arc<PhysicalPlan>,
+    partition_count: usize,
+    group_count: usize,
+    aggregate_exprs: Vec<Expr>,
+    output_schema: SchemaRef,
+    operator_id: OperatorId,
+}
+
+impl PartialAggregatePlan {
+    pub(crate) fn worker_plan(&self) -> &PhysicalPlan {
+        self.worker_plan.as_ref()
+    }
+
+    pub(crate) fn partition_count(&self) -> usize {
+        self.partition_count
+    }
+
+    pub(crate) fn operator_id(&self) -> OperatorId {
+        self.operator_id
+    }
+
+    pub(crate) fn merge(
+        &self,
+        batches: &[RecordBatch],
+        memory: &QueryMemory,
+    ) -> Result<RecordBatch> {
+        merge_partials(
+            batches,
+            self.group_count,
+            &self.aggregate_exprs,
+            self.output_schema.clone(),
+            memory,
+        )
+    }
+}
+
+/// Splits a top-level, non-distinct hash aggregate into partition-local and final phases.
+///
+/// Returning `None` means the physical shape cannot be merged with the aggregate-state format
+/// implemented today (for example, a distinct aggregate or an input containing a join).
+pub(crate) fn split_mergeable_aggregate(
+    plan: &PhysicalPlan,
+) -> Result<Option<PartialAggregatePlan>> {
+    let PhysicalPlan::HashAggregate {
+        id,
+        input,
+        group_exprs,
+        aggregate_exprs,
+        schema,
+    } = plan
+    else {
+        return Ok(None);
+    };
+    if aggregate_exprs.iter().any(is_distinct_aggregate) {
+        return Ok(None);
+    }
+    let Some(partition_count) = scan_partitions(input) else {
+        return Ok(None);
+    };
+    if partition_count == 0 {
+        return Err(SparkXError::execution(
+            "distributed aggregate input exposes no scan partitions",
+        ));
+    }
+
+    let partial_exprs = partial_aggregate_exprs(aggregate_exprs)?;
+    let partial_schema = aggregate_schema(input.schema(), group_exprs, &partial_exprs)?;
+    let worker_plan = Arc::new(PhysicalPlan::HashAggregate {
+        id: *id,
+        input: input.clone(),
+        group_exprs: group_exprs.clone(),
+        aggregate_exprs: partial_exprs,
+        schema: partial_schema,
+    });
+    Ok(Some(PartialAggregatePlan {
+        worker_plan,
+        partition_count,
+        group_count: group_exprs.len(),
+        aggregate_exprs: aggregate_exprs.clone(),
+        output_schema: schema.clone(),
+        operator_id: *id,
+    }))
 }
 
 impl LocalCluster {

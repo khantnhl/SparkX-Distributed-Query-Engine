@@ -43,7 +43,7 @@ struct Args {
     #[arg(long)]
     distributed: bool,
 
-    /// Execute eligible partition-local SQL through a standalone coordinator and workers.
+    /// Execute eligible partition-local or aggregate SQL through standalone services.
     #[arg(long, conflicts_with = "distributed")]
     remote_coordinator: Option<String>,
 
