@@ -185,8 +185,10 @@ Each partial batch is Arrow-encoded by a Flight client, sent through gRPC to a q
 
 The transport-neutral contracts in `protocol.rs` define versioned coordinator assignments and
 worker registration, heartbeat, task-state, lease, cancellation, and immutable shuffle-block
-messages. IDs and cross-message ownership are validated before use, and the contracts round-trip
-through Serde. `StagePlan.plan_fragment` contains a versioned Protobuf physical plan supporting every
+messages. Once dependencies succeed, an assignment carries their output-block manifests in stable
+stage and partition order so the downstream worker has explicit input locations. IDs, dependency
+membership, block metadata, and cross-message ownership are validated before use, and the contracts
+round-trip through Serde. `StagePlan.plan_fragment` contains a versioned Protobuf physical plan supporting every
 current physical operator and expression. Fragments are bounded to 16 MiB and 128 plan levels,
 reject malformed or unsupported values, and carry explicit Arrow field contracts. Scan nodes contain
 the catalog table name instead of a serialized `TableProvider`; decoding resolves that provider in the
@@ -196,7 +198,7 @@ worker catalog and rejects schema drift before execution.
 transport-independent `Coordinator`. Each Tokio worker decodes the assigned stage fragment through
 its catalog, executes only the leased partition, and reports success, failure, or cancellation as a
 validated worker message. The coordinator deterministically selects live workers, gates stages on
-successful dependencies, leases partition attempts, requeues timed-out or
+successful dependencies, attaches their immutable output manifests, leases partition attempts, requeues timed-out or
 retryable attempts within a configured bound, validates task ownership, retains successful shuffle
 blocks, and cancels query state. Heartbeat and lease deadlines are driven by caller-supplied timestamps,
 which keeps the state machine deterministic in tests.

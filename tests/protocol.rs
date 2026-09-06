@@ -43,6 +43,24 @@ fn task() -> TaskAttemptId {
     }
 }
 
+fn dependency_block() -> ShuffleBlock {
+    ShuffleBlock {
+        producer: TaskAttemptId {
+            query_id: QueryId::new("query-42").unwrap(),
+            stage_id: StageId(1),
+            partition_id: PartitionId(0),
+            attempt: 0,
+        },
+        output_partition: PartitionId(3),
+        rows: 10,
+        bytes: 80,
+        checksum: "crc32c:42".to_owned(),
+        location: ShuffleLocation::ObjectStore {
+            uri: "s3://sparkx/query-42/stage-1/part-0.arrow".to_owned(),
+        },
+    }
+}
+
 #[test]
 fn coordinator_assignment_round_trips_and_validates() {
     let message = CoordinatorMessage::AssignTask {
@@ -54,6 +72,7 @@ fn coordinator_assignment_round_trips_and_validates() {
             issued_at_ms: 1_000,
             expires_at_ms: 31_000,
         },
+        input_blocks: vec![dependency_block()],
     };
     message.validate().unwrap();
 
@@ -99,6 +118,7 @@ fn rejects_inconsistent_stage_task_and_lease_contracts() {
             issued_at_ms: 1_000,
             expires_at_ms: 31_000,
         },
+        input_blocks: Vec::new(),
     };
     assert!(matches!(
         invalid_partition.validate(),
@@ -114,9 +134,32 @@ fn rejects_inconsistent_stage_task_and_lease_contracts() {
             issued_at_ms: 1_000,
             expires_at_ms: 1_000,
         },
+        input_blocks: Vec::new(),
     };
     assert!(matches!(
         expired_lease.validate(),
+        Err(SparkXError::Protocol(_))
+    ));
+
+    let unrelated_input = CoordinatorMessage::AssignTask {
+        version: PROTOCOL_VERSION,
+        stage: stage(),
+        task: task(),
+        lease: TaskLease {
+            worker_id: WorkerId::new("worker-a").unwrap(),
+            issued_at_ms: 1_000,
+            expires_at_ms: 31_000,
+        },
+        input_blocks: vec![ShuffleBlock {
+            producer: TaskAttemptId {
+                stage_id: StageId(0),
+                ..dependency_block().producer
+            },
+            ..dependency_block()
+        }],
+    };
+    assert!(matches!(
+        unrelated_input.validate(),
         Err(SparkXError::Protocol(_))
     ));
 

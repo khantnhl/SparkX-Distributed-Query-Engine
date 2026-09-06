@@ -123,8 +123,40 @@ fn schedules_ready_stages_deterministically_and_unblocks_dependencies() {
     assert_eq!(second_worker, "worker-b");
     assert!(coordinator.next_assignment(1).unwrap().is_none());
 
-    succeed(&mut coordinator, &first_worker, first, 2, Vec::new());
-    succeed(&mut coordinator, &second_worker, second, 2, Vec::new());
+    let first_block = ShuffleBlock {
+        producer: first.clone(),
+        output_partition: first.partition_id,
+        rows: 10,
+        bytes: 80,
+        checksum: "crc32c:first".to_owned(),
+        location: ShuffleLocation::Worker {
+            worker_id: WorkerId::new(&first_worker).unwrap(),
+        },
+    };
+    let second_block = ShuffleBlock {
+        producer: second.clone(),
+        output_partition: second.partition_id,
+        rows: 12,
+        bytes: 96,
+        checksum: "crc32c:second".to_owned(),
+        location: ShuffleLocation::Worker {
+            worker_id: WorkerId::new(&second_worker).unwrap(),
+        },
+    };
+    succeed(
+        &mut coordinator,
+        &first_worker,
+        first,
+        2,
+        vec![first_block.clone()],
+    );
+    succeed(
+        &mut coordinator,
+        &second_worker,
+        second,
+        2,
+        vec![second_block.clone()],
+    );
     assert_eq!(
         coordinator.stage_status(&query_id(), StageId(0)).unwrap(),
         StageStatus::Succeeded
@@ -134,10 +166,20 @@ fn schedules_ready_stages_deterministically_and_unblocks_dependencies() {
         StageStatus::Ready
     );
 
-    let (dependent_stage, dependent, dependent_worker) = assignment(&mut coordinator, 3);
+    let CoordinatorMessage::AssignTask {
+        stage: dependent_stage,
+        task: dependent,
+        lease,
+        input_blocks,
+        ..
+    } = coordinator.next_assignment(3).unwrap().unwrap()
+    else {
+        panic!("expected dependent task assignment");
+    };
     assert_eq!(dependent_stage.stage_id, StageId(1));
     assert_eq!(dependent.partition_id, PartitionId(0));
-    assert_eq!(dependent_worker, "worker-a");
+    assert_eq!(lease.worker_id.as_str(), "worker-a");
+    assert_eq!(input_blocks, vec![first_block, second_block]);
 }
 
 #[test]

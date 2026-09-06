@@ -83,6 +83,8 @@ transport. Versioned Protobuf fragments now encode every current physical operat
 workers resolve scans through their catalog and validate the embedded Arrow contract before running.
 An in-memory coordinator now enforces worker resources, heartbeat timeouts, dependency-aware
 scheduling, task leases, bounded attempts, ownership, output-block retention, and cancellation.
+Dependent task assignments now carry validated upstream block manifests in deterministic stage and
+partition order, establishing the input contract needed by remote downstream operators.
 The local cluster now drives real queries through coordinator assignments and worker task updates.
 An Arrow Flight `DoAction` control service now transports stage submission, registration, heartbeats,
 worker-specific assignment polling, task updates, and cancellation over gRPC. A standalone worker

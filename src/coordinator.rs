@@ -309,6 +309,8 @@ impl Coordinator {
             expires_at_ms,
         };
 
+        let input_blocks = self.dependency_output_blocks(&stage_key)?;
+
         let stage = self
             .stages
             .get_mut(&stage_key)
@@ -329,9 +331,34 @@ impl Coordinator {
             stage: stage.plan.clone(),
             task,
             lease,
+            input_blocks,
         };
         assignment.validate()?;
         Ok(Some(assignment))
+    }
+
+    fn dependency_output_blocks(&self, stage_key: &StageKey) -> Result<Vec<ShuffleBlock>> {
+        let stage = self
+            .stages
+            .get(stage_key)
+            .expect("selected stage must exist");
+        let mut blocks = Vec::new();
+        for dependency_id in &stage.plan.input_stages {
+            let dependency = self
+                .stages
+                .get(&(stage_key.0.clone(), *dependency_id))
+                .expect("submitted stage dependency must exist");
+            for partition in &dependency.partitions {
+                let PartitionRuntime::Succeeded { output_blocks, .. } = partition else {
+                    return Err(coordinator_error(format!(
+                        "stage {} was selected before dependency {} succeeded",
+                        stage_key.1.0, dependency_id.0
+                    )));
+                };
+                blocks.extend(output_blocks.iter().cloned());
+            }
+        }
+        Ok(blocks)
     }
 
     pub fn cancel_query(

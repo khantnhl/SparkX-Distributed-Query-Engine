@@ -52,6 +52,7 @@ their assigned partitions, and publish Arrow output blocks for the client to ret
 - Two-stage remote aggregation with worker partials and a memory-accounted driver merge
 - Versioned Protobuf physical-plan fragments with worker-side schema validation
 - Coordinator-managed workers, slots, heartbeats, leases, attempts, retries, and cancellation
+- Dependency-aware task assignments carrying immutable upstream block manifests
 - Standalone coordinator and worker processes connected through Arrow Flight/gRPC
 - Bounded worker-hosted output blocks with tickets, ownership, checksums, and deletion
 - Logical, optimized, and physical plan explanations

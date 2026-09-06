@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -191,35 +191,19 @@ pub struct ShuffleBlock {
 }
 
 impl ShuffleBlock {
-    fn validate_for(&self, task: &TaskAttemptId, reporting_worker: &WorkerId) -> Result<()> {
-        if &self.producer != task {
-            return Err(protocol_error(
-                "shuffle block producer does not match task update",
-            ));
-        }
+    pub fn validate(&self) -> Result<()> {
+        self.producer.validate()?;
         if self.checksum.trim().is_empty() {
             return Err(protocol_error("shuffle block checksum must not be empty"));
         }
         match &self.location {
-            ShuffleLocation::Worker { worker_id } => {
-                worker_id.validate()?;
-                if worker_id != reporting_worker {
-                    return Err(protocol_error(
-                        "in-memory shuffle block must be owned by the reporting worker",
-                    ));
-                }
-            }
+            ShuffleLocation::Worker { worker_id } => worker_id.validate(),
             ShuffleLocation::Flight {
                 worker_id,
                 endpoint,
                 ticket,
             } => {
                 worker_id.validate()?;
-                if worker_id != reporting_worker {
-                    return Err(protocol_error(
-                        "Flight shuffle block must be owned by the reporting worker",
-                    ));
-                }
                 let authority = endpoint
                     .strip_prefix("http://")
                     .or_else(|| endpoint.strip_prefix("https://"));
@@ -233,11 +217,36 @@ impl ShuffleBlock {
                 if ticket.trim().is_empty() {
                     return Err(protocol_error("Flight shuffle ticket must not be empty"));
                 }
+                Ok(())
             }
-            ShuffleLocation::ObjectStore { uri } if uri.trim().is_empty() => {
-                return Err(protocol_error(
-                    "shuffle object-store location must not be empty",
-                ));
+            ShuffleLocation::ObjectStore { uri } if uri.trim().is_empty() => Err(protocol_error(
+                "shuffle object-store location must not be empty",
+            )),
+            ShuffleLocation::ObjectStore { .. } => Ok(()),
+        }
+    }
+
+    fn validate_for(&self, task: &TaskAttemptId, reporting_worker: &WorkerId) -> Result<()> {
+        self.validate()?;
+        if &self.producer != task {
+            return Err(protocol_error(
+                "shuffle block producer does not match task update",
+            ));
+        }
+        match &self.location {
+            ShuffleLocation::Worker { worker_id } => {
+                if worker_id != reporting_worker {
+                    return Err(protocol_error(
+                        "in-memory shuffle block must be owned by the reporting worker",
+                    ));
+                }
+            }
+            ShuffleLocation::Flight { worker_id, .. } => {
+                if worker_id != reporting_worker {
+                    return Err(protocol_error(
+                        "Flight shuffle block must be owned by the reporting worker",
+                    ));
+                }
             }
             ShuffleLocation::ObjectStore { .. } => {}
         }
@@ -322,6 +331,8 @@ pub enum CoordinatorMessage {
         stage: StagePlan,
         task: TaskAttemptId,
         lease: TaskLease,
+        /// Immutable outputs from every completed dependency stage, in dependency/partition order.
+        input_blocks: Vec<ShuffleBlock>,
     },
     CancelQuery {
         version: u16,
@@ -338,11 +349,26 @@ impl CoordinatorMessage {
                 stage,
                 task,
                 lease,
+                input_blocks,
             } => {
                 validate_version(*version)?;
                 stage.validate()?;
                 task.validate_for(stage)?;
-                lease.validate()
+                lease.validate()?;
+                for block in input_blocks {
+                    block.validate()?;
+                    if block.producer.query_id != stage.query_id {
+                        return Err(protocol_error(
+                            "assignment input block belongs to a different query",
+                        ));
+                    }
+                    if !stage.input_stages.contains(&block.producer.stage_id) {
+                        return Err(protocol_error(
+                            "assignment input block was not produced by a dependency stage",
+                        ));
+                    }
+                }
+                Ok(())
             }
             Self::CancelQuery {
                 version,
