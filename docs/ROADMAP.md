@@ -1,5 +1,8 @@
 # From prototype to serious engine
 
+For the current distributed build sequence, checkboxes, and completion evidence, use the
+[build tracker](BUILD_PLAN.md).
+
 The order matters: make semantics observable and memory-safe before adding machines. Each phase has an exit criterion so “distributed” does not become a vague forever-project.
 
 ## Phase 0 — current scrappy prototype

@@ -61,6 +61,8 @@ their assigned partitions, and publish Arrow output blocks for the client to ret
 
 See [SQL support](docs/SQL_SUPPORT.md) for the precise language and type boundaries.
 
+Track upcoming remote joins, persistent shuffle, and recovery work in the [build plan](docs/BUILD_PLAN.md).
+
 ## Execution modes
 
 | Mode | Command option | What runs |

@@ -6,6 +6,7 @@ pub mod data_plane;
 pub mod distributed;
 pub(crate) mod flight_exchange;
 pub(crate) mod hash_exchange;
+pub mod join;
 pub mod plan_codec;
 pub mod protocol;
 pub mod remote;
