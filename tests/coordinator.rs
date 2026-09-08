@@ -497,3 +497,56 @@ fn records_successful_blocks_and_cancels_active_queries() {
         Err(SparkXError::Protocol(_))
     ));
 }
+
+#[test]
+fn hash_exchange_routes_only_matching_destination_blocks() {
+    let mut coordinator = coordinator(100, 50, 3);
+    let mut upstream = stage(0, vec![], 1);
+    upstream.output_exchange = Some(sparkx::protocol::HashExchange {
+        columns: vec![0],
+        partition_count: 2,
+    });
+    coordinator.submit_stage(upstream).unwrap();
+    let mut downstream = stage(1, vec![0], 2);
+    downstream.partitioned_input = true;
+    let mut incompatible = downstream.clone();
+    incompatible.partition_count = 3;
+    assert!(coordinator.submit_stage(incompatible).is_err());
+    coordinator.submit_stage(downstream).unwrap();
+    register(&mut coordinator, "worker", 2, 0);
+    let (_, task, worker) = assignment(&mut coordinator, 0);
+    let blocks = (0..2)
+        .map(|partition| ShuffleBlock {
+            producer: task.clone(),
+            output_partition: PartitionId(partition),
+            rows: 0,
+            bytes: 0,
+            checksum: "empty".to_owned(),
+            location: ShuffleLocation::Worker {
+                worker_id: WorkerId::new(&worker).unwrap(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let invalid = WorkerMessage::TaskUpdate {
+        version: PROTOCOL_VERSION,
+        worker_id: WorkerId::new(&worker).unwrap(),
+        task: task.clone(),
+        state: TaskState::Succeeded {
+            finished_at_ms: 1,
+            output_blocks: vec![blocks[0].clone()],
+        },
+    };
+    assert!(coordinator.handle_worker_message(invalid, 1).is_err());
+    succeed(&mut coordinator, &worker, task, 1, blocks);
+    for expected in 0..2 {
+        let CoordinatorMessage::AssignTask {
+            task, input_blocks, ..
+        } = coordinator.next_assignment(2).unwrap().unwrap()
+        else {
+            panic!("expected assignment")
+        };
+        assert_eq!(task.partition_id, PartitionId(expected));
+        assert_eq!(input_blocks.len(), 1);
+        assert_eq!(input_blocks[0].output_partition, task.partition_id);
+    }
+}

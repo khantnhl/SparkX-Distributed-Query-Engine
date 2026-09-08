@@ -96,9 +96,9 @@ download and explicit deletion. A driver-side runner now submits one pre-fragmen
 stage/partition status, propagates timeout/cancellation, and collects verified output. Session-level
 partition-local scan/filter/projection SQL now uses that runner. Top-level non-distinct aggregates
 over join-free inputs now form a two-stage remote graph: first-stage workers publish partial states,
-the coordinator supplies their manifests to a dependent task, and the final worker fetches them over
-Flight into bounded query memory before merging. Repartitioned exchange and durable shuffle remain
-open.
+the coordinator routes manifests to dependent tasks, and final workers fetch their partitions over
+Flight into bounded query memory before merging. Grouped aggregates now hash-partition partial states for parallel downstream merges. Durable shuffle
+and exchange planning for joins and sorting remain open.
 
 Split the current `LocalCluster` seam into:
 

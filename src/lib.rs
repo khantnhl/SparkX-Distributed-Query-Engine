@@ -4,28 +4,33 @@
 //! vectorized operators, scheduler, and metrics) while using Apache Arrow as its
 //! in-memory ABI and Parquet/CSV as storage formats.
 
-pub mod cancellation;
-pub mod catalog;
-pub mod control_plane;
-pub mod coordinator;
-pub mod data_plane;
-pub mod distributed;
+pub mod query;
+pub use query::expr;
+pub use query::logical;
+pub use query::optimizer;
+pub use query::planner;
+pub use query::session;
+pub mod runtime;
+pub use runtime::cancellation;
+pub use runtime::execution;
+pub use runtime::memory;
+pub use runtime::metrics;
+pub(crate) use runtime::row_key;
+pub mod storage;
+pub use storage::catalog;
+pub(crate) use storage::pruning;
+pub mod cluster;
+pub use cluster::control_plane;
+pub use cluster::coordinator;
+pub use cluster::data_plane;
+pub use cluster::distributed;
+pub(crate) use cluster::flight_exchange;
+pub(crate) use cluster::hash_exchange;
+pub use cluster::plan_codec;
+pub use cluster::protocol;
+pub use cluster::remote;
+pub use cluster::worker;
 pub mod error;
-pub mod execution;
-pub mod expr;
-mod flight_exchange;
-pub mod logical;
-pub mod memory;
-pub mod metrics;
-pub mod optimizer;
-pub mod plan_codec;
-pub mod planner;
-pub mod protocol;
-mod pruning;
-pub mod remote;
-mod row_key;
-pub mod session;
-pub mod worker;
 
 pub use cancellation::CancellationToken;
 pub use error::{Result, SparkXError};

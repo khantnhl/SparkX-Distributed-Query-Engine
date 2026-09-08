@@ -373,18 +373,56 @@ async fn execute_assignment(assignment: TaskAssignmentExecution) -> TaskCompleti
             &context.memory,
         )
         .await?;
+        if !stage.input_stages.is_empty() {
+            // Each task's dependency catalog contains exactly its own input as partition zero.
+            context.partition = Some(0);
+        }
         let plan = stage.decode_physical_plan(&task_catalog)?;
         let schema = plan.schema();
         let batches = execute(plan, context.clone()).collect().await?;
         context.cancellation.check()?;
         let mut data_client = FlightDataPlaneClient::connect(data_endpoint).await?;
-        let block = data_client
-            .upload(worker_id, task.clone(), task.partition_id, schema, batches)
-            .await?;
+        let mut blocks = Vec::new();
+        let mut reservation = context.memory.try_reserve(0)?;
+        for batch in &batches {
+            reservation.try_grow(batch.get_array_memory_size() as u64)?;
+        }
+        let outputs = match &stage.output_exchange {
+            Some(exchange) => crate::hash_exchange::repartition(
+                &schema,
+                &batches,
+                exchange,
+                &context.memory,
+                &context.cancellation,
+            )?,
+            None => vec![(task.partition_id, batches, context.memory.try_reserve(0)?)],
+        };
+        for (partition, batches, _reservation) in outputs {
+            let upload = async {
+                context.cancellation.check()?;
+                data_client
+                    .upload(
+                        worker_id.clone(),
+                        task.clone(),
+                        partition,
+                        schema.clone(),
+                        batches,
+                    )
+                    .await
+            }
+            .await;
+            match upload {
+                Ok(block) => blocks.push(block),
+                Err(error) => {
+                    discard_output_blocks(&blocks).await;
+                    return Err(error);
+                }
+            }
+        }
         Ok(TaskOutput {
-            rows: block.rows,
-            bytes: block.bytes,
-            blocks: vec![block],
+            rows: blocks.iter().map(|block| block.rows).sum(),
+            bytes: blocks.iter().map(|block| block.bytes).sum(),
+            blocks,
         })
     }
     .await;

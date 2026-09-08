@@ -197,21 +197,33 @@ impl Session {
             let partition_count = remote_partition_count_from_usize(aggregate.partition_count())?;
             let partial_stage_id = StageId(0);
             let final_stage_id = StageId(1);
-            let partial_stage = StagePlan::from_physical_plan(
+            let mut partial_stage = StagePlan::from_physical_plan(
                 query_id.clone(),
                 partial_stage_id,
                 Vec::new(),
                 partition_count,
                 aggregate.worker_plan(),
             )?;
+            let merge_partitions = if aggregate.group_count() == 0 {
+                1
+            } else {
+                partition_count
+            };
+            if aggregate.group_count() > 0 {
+                partial_stage.output_exchange = Some(crate::protocol::HashExchange {
+                    columns: (0..aggregate.group_count()).collect(),
+                    partition_count: merge_partitions,
+                });
+            }
             let final_plan = aggregate.final_worker_plan(partial_stage_id)?;
-            let final_stage = StagePlan::from_physical_plan(
+            let mut final_stage = StagePlan::from_physical_plan(
                 query_id,
                 final_stage_id,
                 vec![partial_stage_id],
-                1,
+                merge_partitions,
                 final_plan.as_ref(),
             )?;
+            final_stage.partitioned_input = aggregate.group_count() > 0;
             let result = RemoteStageRunner::new(remote)?
                 .execute_graph(
                     vec![partial_stage, final_stage],
@@ -220,7 +232,7 @@ impl Session {
                 )
                 .await?;
             let task_count = partition_count
-                .checked_add(1)
+                .checked_add(merge_partitions)
                 .ok_or_else(|| SparkXError::execution("remote aggregate task count overflowed"))?;
             (
                 result.batches,

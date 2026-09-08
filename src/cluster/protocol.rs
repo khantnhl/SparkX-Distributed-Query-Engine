@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 const STAGE_INPUT_TABLE_PREFIX: &str = "__sparkx_stage_input_";
 
 pub(crate) fn stage_input_table_name(stage_id: StageId) -> String {
@@ -66,6 +66,13 @@ pub struct StageId(pub u32);
 #[serde(transparent)]
 pub struct PartitionId(pub u32);
 
+/// Hash routing uses CRC32 of Arrow row-encoded key columns (protocol version 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashExchange {
+    pub columns: Vec<usize>,
+    pub partition_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagePlan {
     pub query_id: QueryId,
@@ -74,6 +81,9 @@ pub struct StagePlan {
     pub partition_count: u32,
     /// Versioned Protobuf bytes produced by [`PhysicalPlanCodec`].
     pub plan_fragment: Vec<u8>,
+    pub output_exchange: Option<HashExchange>,
+    /// Read only dependency blocks addressed to this task's partition.
+    pub partitioned_input: bool,
 }
 
 impl StagePlan {
@@ -90,6 +100,8 @@ impl StagePlan {
             input_stages,
             partition_count,
             plan_fragment: PhysicalPlanCodec::encode(plan)?,
+            output_exchange: None,
+            partitioned_input: false,
         };
         stage.validate()?;
         Ok(stage)
@@ -106,6 +118,16 @@ impl StagePlan {
             return Err(protocol_error(
                 "stage partition count must be greater than zero",
             ));
+        }
+        if let Some(exchange) = &self.output_exchange {
+            if exchange.partition_count == 0 || exchange.columns.is_empty() {
+                return Err(protocol_error(
+                    "hash exchange needs keys and a nonzero partition count",
+                ));
+            }
+        }
+        if self.partitioned_input && self.input_stages.is_empty() {
+            return Err(protocol_error("partitioned input requires a dependency"));
         }
         PhysicalPlanCodec::validate_fragment(&self.plan_fragment)?;
         let mut dependencies = BTreeSet::new();
@@ -336,7 +358,7 @@ pub enum CoordinatorMessage {
         stage: StagePlan,
         task: TaskAttemptId,
         lease: TaskLease,
-        /// Immutable outputs from every completed dependency stage, in dependency/partition order.
+        /// Immutable dependency outputs in producer order, filtered by destination for partitioned input.
         input_blocks: Vec<ShuffleBlock>,
     },
     CancelQuery {
@@ -362,6 +384,9 @@ impl CoordinatorMessage {
                 lease.validate()?;
                 for block in input_blocks {
                     block.validate()?;
+                    if stage.partitioned_input && block.output_partition != task.partition_id {
+                        return Err(protocol_error("input block targets a different partition"));
+                    }
                     if block.producer.query_id != stage.query_id {
                         return Err(protocol_error(
                             "assignment input block belongs to a different query",

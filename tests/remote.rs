@@ -368,7 +368,9 @@ async fn session_executes_two_stage_remote_aggregate() {
         .await
         .unwrap();
 
-    let batch = &result.batches[0];
+    let combined =
+        arrow::compute::concat_batches(&result.batches[0].schema(), &result.batches).unwrap();
+    let batch = &combined;
     let regions = batch
         .column(0)
         .as_any()
@@ -419,7 +421,7 @@ async fn session_executes_two_stage_remote_aggregate() {
     assert!(rows.is_empty());
     assert!(result.distributed);
     assert_eq!(result.stages, 2);
-    assert_eq!(result.metrics.tasks, 5);
+    assert_eq!(result.metrics.tasks, 8);
     assert_eq!(result.metrics.output_rows, 2);
     assert_eq!(result.metrics.shuffled_rows, 4);
     assert!(result.metrics.shuffled_bytes > 0);
@@ -448,6 +450,36 @@ async fn session_executes_two_stage_remote_aggregate() {
             SparkXError::NotFound(_)
         ));
     }
+
+    let global = session
+        .execute_sql_remote(
+            "SELECT COUNT(*) AS orders FROM sales",
+            QueryId::new("query-global-after-exchange").unwrap(),
+            RemoteStageConfig::new(server.endpoint()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(global.metrics.tasks, 5);
+    assert_eq!(
+        global.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0),
+        6
+    );
+    let empty = session
+        .execute_sql_remote(
+            "SELECT region, COUNT(*) AS orders FROM sales WHERE amount > 1000 GROUP BY region",
+            QueryId::new("query-empty-exchange").unwrap(),
+            RemoteStageConfig::new(server.endpoint()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.metrics.tasks, 8);
+    assert_eq!(empty.metrics.output_rows, 0);
+    assert!(empty.cleanup_errors.is_empty());
 
     shutdown.cancel();
     for handle in worker_handles {

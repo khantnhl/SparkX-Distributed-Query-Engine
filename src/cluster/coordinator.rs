@@ -214,6 +214,31 @@ impl Coordinator {
             }
         }
 
+        if stage.partitioned_input {
+            for dependency in &stage.input_stages {
+                let upstream = &self.stages[&(stage.query_id.clone(), *dependency)].plan;
+                if upstream
+                    .output_exchange
+                    .as_ref()
+                    .map(|exchange| exchange.partition_count)
+                    != Some(stage.partition_count)
+                {
+                    return Err(coordinator_error(
+                        "partitioned dependency must use matching hash exchange",
+                    ));
+                }
+            }
+        }
+        if stage
+            .output_exchange
+            .as_ref()
+            .is_some_and(|exchange| exchange.partition_count > self.config.max_stage_partitions)
+        {
+            return Err(coordinator_error(
+                "exchange exceeds configured partition maximum",
+            ));
+        }
+
         let partitions = (0..stage.partition_count)
             .map(|_| PartitionRuntime::Pending { next_attempt: 0 })
             .collect();
@@ -309,7 +334,10 @@ impl Coordinator {
             expires_at_ms,
         };
 
-        let input_blocks = self.dependency_output_blocks(&stage_key)?;
+        let mut input_blocks = self.dependency_output_blocks(&stage_key)?;
+        if self.stages[&stage_key].plan.partitioned_input {
+            input_blocks.retain(|block| block.output_partition == task.partition_id);
+        }
 
         let stage = self
             .stages
@@ -691,6 +719,24 @@ impl Coordinator {
             .get_mut(&key)
             .ok_or_else(|| stage_not_found(&task.query_id, task.stage_id))?;
         task.validate_for(&stage.plan)?;
+        if let (Some(exchange), TaskState::Succeeded { output_blocks, .. }) =
+            (&stage.plan.output_exchange, &state)
+        {
+            let destinations = output_blocks
+                .iter()
+                .map(|block| block.output_partition.0)
+                .collect::<std::collections::BTreeSet<_>>();
+            if output_blocks.len() != exchange.partition_count as usize
+                || destinations.len() != exchange.partition_count as usize
+                || destinations
+                    .iter()
+                    .any(|partition| *partition >= exchange.partition_count)
+            {
+                return Err(coordinator_error(
+                    "hash exchange must commit exactly one block per destination",
+                ));
+            }
+        }
         let partition = stage.partitions.get_mut(partition_index).ok_or_else(|| {
             coordinator_error(format!(
                 "task partition {} is missing from coordinator state",

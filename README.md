@@ -70,8 +70,9 @@ See [SQL support](docs/SQL_SUPPORT.md) for the precise language and type boundar
 | Remote | `--remote-coordinator URL` | Separate processes execute partition-local plans or mergeable two-stage aggregates |
 
 Remote SQL supports `Scan`, `Filter`, and `Projection`, plus a top-level non-distinct aggregate over
-a join-free input. First-stage workers publish partition-local aggregate states, and a dependent
-worker fetches those immutable blocks over Flight and performs the final merge. Joins, sorting,
+a join-free input. First-stage workers publish partition-local aggregate states, and dependent
+workers fetch their assigned blocks over Flight and merge groups in parallel. Group keys determine
+the destination; global aggregates use one merge task. Joins, sorting,
 limits, and distinct aggregates still require broader exchange planning and are rejected before
 submission.
 
@@ -169,7 +170,7 @@ cargo run --bin sparkx -- \
 ```
 
 Or run a mergeable aggregate. First-stage workers produce partial aggregate states, and the
-coordinator assigns their verified block manifests to a downstream worker for the final merge:
+coordinator assigns verified block manifests to downstream workers for partitioned final merging:
 
 ```bash
 cargo run --bin sparkx -- \
@@ -199,15 +200,20 @@ the limit with `--data-storage-bytes`.
 
 | Area | Main files |
 |---|---|
-| SQL and query lifecycle | `src/session.rs`, `src/expr.rs` |
-| Logical planning and optimization | `src/logical.rs`, `src/optimizer.rs` |
-| Physical planning and execution | `src/planner.rs`, `src/execution.rs` |
-| Storage and memory | `src/catalog.rs`, `src/memory.rs` |
-| Local distributed execution | `src/distributed.rs`, `src/flight_exchange.rs` |
-| Distributed contracts and scheduling | `src/protocol.rs`, `src/coordinator.rs`, `src/plan_codec.rs` |
-| Remote transport and execution | `src/control_plane.rs`, `src/data_plane.rs`, `src/remote.rs`, `src/worker.rs` |
+| SQL and query lifecycle | `src/query/session.rs`, `src/query/expr.rs` |
+| Logical planning and optimization | `src/query/logical.rs`, `src/query/optimizer.rs` |
+| Physical planning and execution | `src/query/planner.rs`, `src/runtime/execution.rs` |
+| Storage and memory | `src/storage/catalog.rs`, `src/runtime/memory.rs` |
+| Local distributed execution | `src/cluster/distributed.rs`, `src/cluster/flight_exchange.rs` |
+| Distributed contracts and scheduling | `src/cluster/protocol.rs`, `src/cluster/coordinator.rs`, `src/cluster/plan_codec.rs` |
+| Remote transport and execution | `src/cluster/control_plane.rs`, `src/cluster/data_plane.rs`, `src/cluster/remote.rs`, `src/cluster/worker.rs` |
 | Command-line programs | `src/bin/sparkx.rs`, `src/bin/sparkx-coordinator.rs`, `src/bin/sparkx-worker.rs` |
 | Verification | `tests/`, `benches/`, `scripts/` |
+
+The source is grouped by responsibility: `query/` owns SQL planning, `runtime/` owns execution and
+resource accounting, `storage/` owns table access, and `cluster/` owns distributed scheduling and
+transport. `bin/` contains executable entry points. Existing public imports such as
+`sparkx::session` remain available through re-exports. See [contributing](CONTRIBUTING.md).
 
 ## Verification
 
@@ -223,7 +229,8 @@ metadata alongside the reports.
 
 ## Current limitations
 
-- Remote aggregate dependencies are materialized in the final worker's bounded query memory.
+- Remote aggregate dependencies are hash-partitioned for grouped merges and materialized in each downstream worker's bounded query memory.
+- Hash exchange currently materializes outputs and emits one block per producer/destination pair.
 - Remote joins, sorting, limits, and distinct aggregates do not yet have exchange and merge stages.
 - Worker output is memory-only and is lost when the worker exits.
 - The coordinator does not persist state or recover after restart.

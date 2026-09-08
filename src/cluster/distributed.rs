@@ -58,6 +58,10 @@ impl PartialAggregatePlan {
         self.worker_plan.as_ref()
     }
 
+    pub(crate) fn group_count(&self) -> usize {
+        self.group_count
+    }
+
     pub(crate) fn partition_count(&self) -> usize {
         self.partition_count
     }

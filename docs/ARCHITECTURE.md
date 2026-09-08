@@ -308,9 +308,9 @@ flowchart LR
 
 Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
 processes, a bounded worker-hosted Flight output sink, partition-local remote SQL, and two-stage
-remote aggregation with worker-to-worker Flight reads now exist. The next step is to repartition
-intermediate blocks for parallel downstream stages; durable/object-store shuffle follows that
-integration.
+remote aggregation with worker-to-worker Flight reads now exist. Grouped aggregates now repartition intermediate blocks by Arrow-encoded group keys using CRC32
+(protocol version 4). Each downstream task receives only its destination blocks, including schema-bearing
+empty blocks. Global aggregates retain one merge task. Durable/object-store shuffle and joins remain open.
 
 ## Non-goals for version 0.1
 
