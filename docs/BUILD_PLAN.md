@@ -15,9 +15,9 @@ output survive failures. This is the execution checklist for the distributed wor
 | B2 | Remote inner hash join | Done | B1 | `962849c`; `tests/remote_joins.rs`: multi-worker parity passed |
 | B3 | Left joins and SQL edge cases | Done | B2 | `ec0cb97`; Seven remote/native/DuckDB cases passed |
 | B4 | Resource limits and failure handling | Done | B3 | `d0698d0`; Distributed lifecycle, stalled-connection, and skew/memory tests passed |
-| B5 | Reproducible join demo and performance baseline | In progress | B4 | — |
-| B6 | Persistent shuffle storage | Pending | B5 | — |
-| B7 | Worker-loss recovery | Pending | B6 | — |
+| B5 | Reproducible join demo and performance baseline | In progress | B4 | `402fdcd`; release baseline and CLI test passed; hosted CI pending |
+| B6 | Persistent shuffle storage | Done | B5 | Six data-plane tests passed, including restart/corruption/capacity |
+| B7 | Worker-loss recovery | In progress | B6 | — |
 
 Continue with **B5**. Each milestone is a reviewable change; split it into smaller commits when needed.
 Statuses are Next, In progress, Blocked, Pending, and Done. Only mark Done after the exit criterion
@@ -94,11 +94,11 @@ instructions. A speedup is not required; correctness and honest measurements are
 
 ## B6 — Persist shuffle output
 
-- [ ] Specify a block-store interface and choose the first persistent backend with a short architecture decision.
-- [ ] Define atomic publication, checksums, attempt ownership, retention, and deletion semantics.
-- [ ] Implement the backend behind the existing transport/storage boundary.
-- [ ] Test storage exhaustion, partial writes, restart behavior, and orphan cleanup.
-- [ ] Document the failure domain: worker-local disk alone does not survive loss of the worker's host.
+- [x] Specify a block-store interface and choose the first persistent backend with a short architecture decision.
+- [x] Define atomic publication, checksums, attempt ownership, retention, and deletion semantics.
+- [x] Implement the backend behind the existing transport/storage boundary.
+- [x] Test storage exhaustion, partial writes, restart behavior, and orphan cleanup.
+- [x] Document the failure domain: worker-local disk alone does not survive loss of the worker's host.
 
 Exit: committed blocks survive the backend's documented restart scenario; incomplete blocks never
 appear as successful outputs. Prove durability with restart tests rather than in-memory tests.

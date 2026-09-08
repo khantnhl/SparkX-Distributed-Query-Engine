@@ -1,5 +1,6 @@
 //! Bounded Arrow Flight storage for task output and shuffle blocks.
 
+use super::block_store::{BlockStorage, DiskBlockStore, MemoryBlockStore};
 use crate::protocol::{
     PROTOCOL_VERSION, PartitionId, ShuffleBlock, ShuffleLocation, TaskAttemptId, WorkerId,
 };
@@ -19,9 +20,9 @@ use arrow_flight::{
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
@@ -64,63 +65,12 @@ struct UploadAck {
     ticket: String,
 }
 
-#[derive(Debug)]
-struct StoredBlock {
-    schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-    checksum: String,
-    charged_bytes: u64,
-}
-
-#[derive(Debug)]
-struct BlockStore {
-    capacity_bytes: u64,
-    used_bytes: u64,
-    blocks: BTreeMap<String, StoredBlock>,
-}
-
-impl BlockStore {
-    fn new(capacity_bytes: u64) -> Result<Self> {
-        if capacity_bytes == 0 {
-            return Err(SparkXError::planning(
-                "data-plane storage capacity must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            capacity_bytes,
-            used_bytes: 0,
-            blocks: BTreeMap::new(),
-        })
-    }
-
-    fn insert(&mut self, ticket: String, block: StoredBlock) -> Result<()> {
-        if let Some(existing) = self.blocks.get(&ticket) {
-            if existing.checksum == block.checksum {
-                return Ok(());
-            }
-            return Err(SparkXError::protocol(
-                "data-plane ticket already contains different output",
-            ));
-        }
-        let next = self.used_bytes.saturating_add(block.charged_bytes);
-        if next > self.capacity_bytes {
-            return Err(SparkXError::resource_exhausted(format!(
-                "data-plane block needs {} bytes with {} of {} bytes already used",
-                block.charged_bytes, self.used_bytes, self.capacity_bytes
-            )));
-        }
-        self.used_bytes = next;
-        self.blocks.insert(ticket, block);
-        Ok(())
-    }
-
-    fn remove(&mut self, ticket: &str) -> Result<()> {
-        let block = self.blocks.remove(ticket).ok_or_else(|| {
-            SparkXError::NotFound(format!("data-plane block {ticket} does not exist"))
-        })?;
-        self.used_bytes = self.used_bytes.saturating_sub(block.charged_bytes);
-        Ok(())
-    }
+#[derive(Debug, Clone)]
+pub(super) struct StoredBlock {
+    pub(super) schema: SchemaRef,
+    pub(super) batches: Vec<RecordBatch>,
+    pub(super) checksum: String,
+    pub(super) charged_bytes: u64,
 }
 
 /// Arrow Flight server that keeps task output available until a consumer deletes it.
@@ -145,7 +95,27 @@ impl FlightDataPlaneServer {
         advertised_host: Option<&str>,
         capacity_bytes: u64,
     ) -> Result<Self> {
-        let store = Arc::new(Mutex::new(BlockStore::new(capacity_bytes)?));
+        Self::bind_with_storage(address, advertised_host, capacity_bytes, None).await
+    }
+
+    /// A dedicated directory retains committed blocks across service restarts.
+    pub async fn bind_with_storage(
+        address: SocketAddr,
+        advertised_host: Option<&str>,
+        capacity_bytes: u64,
+        directory: Option<&Path>,
+    ) -> Result<Self> {
+        let directory = directory.map(Path::to_path_buf);
+        let backend: Box<dyn BlockStorage> =
+            tokio::task::spawn_blocking(move || -> Result<Box<dyn BlockStorage>> {
+                Ok(match directory {
+                    Some(path) => Box::new(DiskBlockStore::open(path, capacity_bytes)?),
+                    None => Box::new(MemoryBlockStore::new(capacity_bytes)?),
+                })
+            })
+            .await
+            .map_err(|error| SparkXError::execution(error.to_string()))??;
+        let store = Arc::new(Mutex::new(backend));
         let listener = TcpListener::bind(address)
             .await
             .map_err(|error| transport_error("bind data-plane server", error))?;
@@ -377,7 +347,21 @@ impl FlightDataPlaneClient {
 
 #[derive(Clone)]
 struct DataPlaneFlightService {
-    store: Arc<Mutex<BlockStore>>,
+    store: Arc<Mutex<Box<dyn BlockStorage>>>,
+}
+
+impl DataPlaneFlightService {
+    async fn access<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut dyn BlockStorage) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || operation(store.blocking_lock().as_mut()))
+            .await
+            .map_err(|error| {
+                SparkXError::execution(format!("block storage task failed: {error}"))
+            })?
+    }
 }
 
 #[tonic::async_trait]
@@ -432,13 +416,12 @@ impl FlightService for DataPlaneFlightService {
         let ticket = String::from_utf8(request.into_inner().ticket.to_vec())
             .map_err(|_| Status::invalid_argument("data-plane ticket must be UTF-8"))?;
         decode_ticket(&ticket).map_err(map_status)?;
-        let store = self.store.lock().await;
-        let block = store.blocks.get(&ticket).ok_or_else(|| {
-            Status::not_found(format!("data-plane block {ticket} does not exist"))
-        })?;
-        let schema = block.schema.clone();
-        let batches = block.batches.clone();
-        drop(store);
+        let block = self
+            .access(move |store| store.get(&ticket))
+            .await
+            .map_err(map_status)?;
+        let schema = block.schema;
+        let batches = block.batches;
         let output = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .with_max_flight_data_size(MAX_FLIGHT_MESSAGE_BYTES / 2)
@@ -472,7 +455,7 @@ impl FlightService for DataPlaneFlightService {
 
         let available_bytes = {
             let store = self.store.lock().await;
-            store.capacity_bytes.saturating_sub(store.used_bytes)
+            store.upload_budget(&ticket)
         };
         if available_bytes == 0 {
             return Err(Status::resource_exhausted(
@@ -505,10 +488,9 @@ impl FlightService for DataPlaneFlightService {
             checksum: checksum.clone(),
             charged_bytes: bytes.max(1),
         };
-        self.store
-            .lock()
+        let stored_ticket = ticket.clone();
+        self.access(move |store| store.insert(stored_ticket, block))
             .await
-            .insert(ticket.clone(), block)
             .map_err(map_status)?;
         let response = UploadAck {
             rows,
@@ -549,10 +531,8 @@ impl FlightService for DataPlaneFlightService {
         let ticket = String::from_utf8(action.body.to_vec())
             .map_err(|_| Status::invalid_argument("data-plane ticket must be UTF-8"))?;
         decode_ticket(&ticket).map_err(map_status)?;
-        self.store
-            .lock()
+        self.access(move |store| store.remove(&ticket))
             .await
-            .remove(&ticket)
             .map_err(map_status)?;
         let output = arrow_flight::Result {
             body: b"deleted".to_vec().into(),
@@ -585,7 +565,10 @@ fn decode_ticket(ticket: &str) -> Result<BlockTicket> {
     Ok(ticket)
 }
 
-fn block_metadata(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<(u64, u64, String)> {
+pub(super) fn block_metadata(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<(u64, u64, String)> {
     let rows = batches.iter().map(|batch| batch.num_rows() as u64).sum();
     let bytes = batches
         .iter()

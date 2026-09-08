@@ -1,5 +1,6 @@
 //! Distributed planning, scheduling, workers, and transport.
 
+mod block_store;
 pub mod control_plane;
 pub mod coordinator;
 pub mod data_plane;

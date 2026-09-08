@@ -36,6 +36,7 @@ pub struct WorkerConfig {
     pub data_bind_address: SocketAddr,
     pub data_advertised_host: Option<String>,
     pub data_storage_bytes: u64,
+    pub data_directory: Option<std::path::PathBuf>,
     /// Development/test escape hatch. Production workers leave this as `None`.
     pub max_terminal_tasks: Option<u64>,
 }
@@ -54,6 +55,7 @@ impl WorkerConfig {
             data_bind_address: "127.0.0.1:0".parse().expect("valid loopback address"),
             data_advertised_host: None,
             data_storage_bytes: crate::DEFAULT_MEMORY_LIMIT_BYTES,
+            data_directory: None,
             max_terminal_tasks: None,
         }
     }
@@ -120,10 +122,11 @@ impl RemoteWorker {
     }
 
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<WorkerRunSummary> {
-        let data_plane = FlightDataPlaneServer::bind(
+        let data_plane = FlightDataPlaneServer::bind_with_storage(
             self.config.data_bind_address,
             self.config.data_advertised_host.as_deref(),
             self.config.data_storage_bytes,
+            self.config.data_directory.as_deref(),
         )
         .await?;
         let data_endpoint = data_plane.endpoint();

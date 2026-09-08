@@ -236,7 +236,7 @@ metadata alongside the reports.
 - Remote aggregate dependencies are hash-partitioned for grouped merges and materialized in each downstream worker's bounded query memory.
 - Hash exchange currently materializes outputs and emits one block per producer/destination pair.
 - Remote chained joins, joins beneath aggregates, sorting, limits, and distinct aggregates remain unsupported.
-- Worker output is memory-only and is lost when the worker exits.
+- Worker output defaults to memory; optional [persistent local storage](docs/SHUFFLE_STORAGE.md) survives service restarts on the same disk.
 - The coordinator does not persist state or recover after restart.
 - Authentication, authorization, and TLS are not implemented.
 - Blocking operators return a memory-limit error instead of spilling to disk.

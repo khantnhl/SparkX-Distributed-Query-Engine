@@ -160,3 +160,141 @@ async fn download_accounts_memory_and_releases_it_on_error() {
     assert!(!client.download(&block).await.unwrap().is_empty());
     server.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn persistent_blocks_survive_restart_and_deletion() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = FlightDataPlaneServer::bind_with_storage(
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        1_000_000,
+        Some(directory.path()),
+    )
+    .await
+    .unwrap();
+    let endpoint = server.endpoint();
+    let address = endpoint.strip_prefix("http://").unwrap().parse().unwrap();
+    let mut client = FlightDataPlaneClient::connect(&endpoint).await.unwrap();
+    let input = batches();
+    let block = client
+        .upload(
+            WorkerId::new("persistent").unwrap(),
+            task(),
+            PartitionId(0),
+            input[0].schema(),
+            input.clone(),
+        )
+        .await
+        .unwrap();
+    let duplicate = client
+        .upload(
+            WorkerId::new("persistent").unwrap(),
+            task(),
+            PartitionId(0),
+            input[0].schema(),
+            input,
+        )
+        .await
+        .unwrap();
+    assert_eq!(block, duplicate);
+    drop(client);
+    server.close().await.unwrap();
+    std::fs::write(
+        directory.path().join("sparkx-interrupted.pending"),
+        b"partial",
+    )
+    .unwrap();
+    let server =
+        FlightDataPlaneServer::bind_with_storage(address, None, 1_000_000, Some(directory.path()))
+            .await
+            .unwrap();
+    assert!(!directory.path().join("sparkx-interrupted.pending").exists());
+    let mut client = FlightDataPlaneClient::connect(server.endpoint())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .download(&block)
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        3
+    );
+    client.delete(&block).await.unwrap();
+    drop(client);
+    server.close().await.unwrap();
+    let server =
+        FlightDataPlaneServer::bind_with_storage(address, None, 1_000_000, Some(directory.path()))
+            .await
+            .unwrap();
+    let mut client = FlightDataPlaneClient::connect(server.endpoint())
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.download(&block).await,
+        Err(SparkXError::NotFound(_))
+    ));
+    server.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn persistent_storage_rejects_overflow_corruption_and_concurrent_owners() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = FlightDataPlaneServer::bind_with_storage(
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        100,
+        Some(directory.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        FlightDataPlaneServer::bind_with_storage(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            100,
+            Some(directory.path())
+        )
+        .await
+        .is_err()
+    );
+    let mut client = FlightDataPlaneClient::connect(server.endpoint())
+        .await
+        .unwrap();
+    let input = batches();
+    // Even an empty block needs a schema and header on disk.
+    assert!(matches!(
+        client
+            .upload(
+                WorkerId::new("full").unwrap(),
+                task(),
+                PartitionId(0),
+                input[0].schema(),
+                vec![]
+            )
+            .await,
+        Err(SparkXError::ResourceExhausted(_))
+    ));
+    assert!(!std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "block")
+    }));
+    drop(client);
+    server.close().await.unwrap();
+    std::fs::write(directory.path().join("sparkx-corrupt.block"), b"invalid").unwrap();
+    assert!(
+        FlightDataPlaneServer::bind_with_storage(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            1_000_000,
+            Some(directory.path())
+        )
+        .await
+        .is_err()
+    );
+}

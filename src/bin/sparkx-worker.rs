@@ -87,6 +87,10 @@ struct Args {
     #[arg(long, default_value_t = sparkx::DEFAULT_MEMORY_LIMIT_BYTES)]
     data_storage_bytes: u64,
 
+    /// Dedicated directory for persistent shuffle blocks. Use a fixed --data-bind port on restart.
+    #[arg(long)]
+    data_directory: Option<PathBuf>,
+
     /// Exit after this many terminal task attempts; intended for development and tests.
     #[arg(long)]
     max_tasks: Option<u64>,
@@ -117,6 +121,7 @@ async fn run() -> Result<()> {
     config.data_bind_address = args.data_bind;
     config.data_advertised_host = args.data_advertised_host;
     config.data_storage_bytes = args.data_storage_bytes;
+    config.data_directory = args.data_directory;
     config.max_terminal_tasks = args.max_tasks;
 
     let shutdown = CancellationToken::new();
