@@ -78,7 +78,7 @@ The standalone-process remote runner supports a physical `Scan` with any chain o
 concatenates verified Flight output blocks. It also splits a top-level, non-distinct hash aggregate
 over a join-free input: workers compute partial states for each scan partition, including `SUM` and
 `COUNT` state pairs for `AVG`, publish them through their Flight data planes, and dependent workers
-fetch hash-routed group states and merge their assigned groups. Global aggregates use one merge task. Remote joins, distinct aggregates,
+fetch hash-routed group states and merge their assigned groups. Global aggregates use one merge task. Remote inner/left column equi-joins are supported through a three-stage hash exchange (see [details](REMOTE_JOINS.md)). Chained joins, aggregates above joins, distinct aggregates,
 `ORDER BY`, and `LIMIT` are rejected before submission because they require repartitioning or broader
 exchange planning. The planning session and remote workers must register matching table names and
 schemas.

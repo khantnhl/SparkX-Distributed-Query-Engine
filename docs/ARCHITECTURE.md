@@ -310,7 +310,7 @@ Physical-plan serialization, deterministic coordinator state, Flight control ser
 processes, a bounded worker-hosted Flight output sink, partition-local remote SQL, and two-stage
 remote aggregation with worker-to-worker Flight reads now exist. Grouped aggregates now repartition intermediate blocks by Arrow-encoded group keys using CRC32
 (protocol version 4). Each downstream task receives only its destination blocks, including schema-bearing
-empty blocks. Global aggregates retain one merge task. Durable/object-store shuffle and joins remain open.
+empty blocks. Global aggregates retain one merge task. Remote inner/left equi-joins now use two producer exchanges and partitioned downstream joins; see [remote join execution](REMOTE_JOINS.md). Durable/object-store shuffle remains separate work.
 
 ## Non-goals for version 0.1
 

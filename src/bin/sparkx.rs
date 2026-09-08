@@ -27,6 +27,10 @@ struct Args {
     #[arg(short, long, default_value = "data")]
     table: String,
 
+    /// Additional CSV/Parquet table in NAME=PATH form. Repeat for joins.
+    #[arg(long = "register", value_name = "NAME=PATH")]
+    additional_tables: Vec<String>,
+
     /// SQL SELECT statement to execute.
     #[arg(short = 'q', long)]
     sql: String,
@@ -123,6 +127,37 @@ async fn run() -> Result<()> {
         InputFormat::Csv => session.register_csv(&args.table, &args.input)?,
         InputFormat::Parquet => session.register_parquet(&args.table, &args.input)?,
         InputFormat::Auto => unreachable!(),
+    }
+
+    for spec in &args.additional_tables {
+        let (name, path) = spec
+            .split_once('=')
+            .filter(|(name, path)| !name.trim().is_empty() && !path.trim().is_empty())
+            .ok_or_else(|| SparkXError::planning("--register requires NAME=PATH"))?;
+        if session
+            .catalog()
+            .table_names()
+            .iter()
+            .any(|existing| existing == name)
+        {
+            return Err(SparkXError::planning(format!(
+                "table {name} is already registered"
+            )));
+        }
+        match PathBuf::from(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("csv") => session.register_csv(name, path)?,
+            Some("parquet") | Some("pq") => session.register_parquet(name, path)?,
+            _ => {
+                return Err(SparkXError::planning(
+                    "additional tables require a .csv or .parquet extension",
+                ));
+            }
+        }
     }
 
     if args.explain {

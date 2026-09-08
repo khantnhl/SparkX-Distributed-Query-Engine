@@ -104,3 +104,8 @@ Comparisons must pin versions, compression, threads, cache state, output materia
 7. Keep improvements only when the gain is repeatable and memory/latency do not regress unexpectedly.
 
 The physical Top-K path gives `ORDER BY ... LIMIT` its own benchmark next to a full sort, Parquet scans can skip row groups from footer statistics, and native/distributed hash paths now share encoded Arrow row keys. Local-distributed timings also include the Protobuf encode/decode and worker-catalog resolution boundary, alongside the loopback Flight exchange. The next high-likelihood wins are page/bloom pruning and reader-level Parquet predicates, a radix/Swiss-table aggregate implementation, streaming output from joins, memory pooling, and code-generated/fused expression pipelines.
+
+## Remote joins
+
+The [remote join baseline](REMOTE_JOINS.md#reproducible-performance-baseline) records uniform and skewed
+release-mode workloads, commands, environment, raw measurements, and metric limitations.

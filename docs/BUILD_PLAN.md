@@ -14,7 +14,7 @@ output survive failures. This is the execution checklist for the distributed wor
 | B1 | Remote join plan and exchange contracts | Done | B0 | `168b657`; `tests/remote_join_plan.rs`: 2 passed |
 | B2 | Remote inner hash join | Done | B1 | `962849c`; `tests/remote_joins.rs`: multi-worker parity passed |
 | B3 | Left joins and SQL edge cases | Done | B2 | `ec0cb97`; Seven remote/native/DuckDB cases passed |
-| B4 | Resource limits and failure handling | Done | B3 | Distributed lifecycle, stalled-connection, and skew/memory tests passed |
+| B4 | Resource limits and failure handling | Done | B3 | `d0698d0`; Distributed lifecycle, stalled-connection, and skew/memory tests passed |
 | B5 | Reproducible join demo and performance baseline | In progress | B4 | — |
 | B6 | Persistent shuffle storage | Pending | B5 | — |
 | B7 | Worker-loss recovery | Pending | B6 | — |
@@ -83,11 +83,11 @@ report partial results as a successful query. Record unreachable-worker cleanup 
 
 Primary files: `README.md`, `docs/SQL_SUPPORT.md`, `docs/ARCHITECTURE.md`, `docs/BENCHMARKS.md`, `benches/`.
 
-- [ ] Document a coordinator/two-worker join demo with both tables registered on the client and workers.
-- [ ] Update the SQL support matrix, stage diagram, and current limitations.
-- [ ] Benchmark native versus remote joins with uniform and skewed keys; record machine, data size, partition count, and commands.
-- [ ] Record elapsed time, rows, shuffle volume, and available memory metrics without claiming unavailable cross-worker metrics.
-- [ ] Run formatting, Clippy, the complete test suite, and CI on supported platforms.
+- [x] Document a coordinator/two-worker join demo with both tables registered on the client and workers.
+- [x] Update the SQL support matrix, stage diagram, and current limitations.
+- [x] Benchmark native versus remote joins with uniform and skewed keys; record machine, data size, partition count, and commands.
+- [x] Record elapsed time, rows, shuffle volume, and available memory metrics without claiming unavailable cross-worker metrics.
+- [ ] Run formatting, Clippy, the complete test suite, and CI on supported platforms. Local verification runs at the end of this build; hosted CI requires a push.
 
 Exit: another contributor can reproduce the join results and benchmark baseline using the checked-in
 instructions. A speedup is not required; correctness and honest measurements are.

@@ -74,9 +74,11 @@ Track upcoming remote joins, persistent shuffle, and recovery work in the [build
 Remote SQL supports `Scan`, `Filter`, and `Projection`, plus a top-level non-distinct aggregate over
 a join-free input. First-stage workers publish partition-local aggregate states, and dependent
 workers fetch their assigned blocks over Flight and merge groups in parallel. Group keys determine
-the destination; global aggregates use one merge task. Joins, sorting,
+the destination; global aggregates use one merge task. Sorting,
 limits, and distinct aggregates still require broader exchange planning and are rejected before
 submission.
+
+Remote inner and left equi-joins also use a three-stage hash exchange. See the [join demo and baseline](docs/REMOTE_JOINS.md).
 
 ## Quick start
 
@@ -233,7 +235,7 @@ metadata alongside the reports.
 
 - Remote aggregate dependencies are hash-partitioned for grouped merges and materialized in each downstream worker's bounded query memory.
 - Hash exchange currently materializes outputs and emits one block per producer/destination pair.
-- Remote joins, sorting, limits, and distinct aggregates do not yet have exchange and merge stages.
+- Remote chained joins, joins beneath aggregates, sorting, limits, and distinct aggregates remain unsupported.
 - Worker output is memory-only and is lost when the worker exits.
 - The coordinator does not persist state or recover after restart.
 - Authentication, authorization, and TLS are not implemented.
