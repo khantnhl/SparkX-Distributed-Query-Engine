@@ -11,15 +11,15 @@ output survive failures. This is the execution checklist for the distributed wor
 | ID | Milestone | Status | Depends on | Completion evidence |
 |---|---|---|---|---|
 | B0 | Hash-partitioned aggregate exchange and source organization | Done | — | Commit `34ef3cf`; 75 tests, Clippy, and formatting passed during implementation |
-| B1 | Remote join plan and exchange contracts | Done | B0 | `tests/remote_join_plan.rs`: 2 passed |
-| B2 | Remote inner hash join | Next | B1 | — |
-| B3 | Left joins and SQL edge cases | Pending | B2 | — |
+| B1 | Remote join plan and exchange contracts | Done | B0 | `168b657`; `tests/remote_join_plan.rs`: 2 passed |
+| B2 | Remote inner hash join | Done | B1 | `tests/remote_joins.rs`: multi-worker parity passed |
+| B3 | Left joins and SQL edge cases | Next | B2 | — |
 | B4 | Resource limits and failure handling | Pending | B3 | — |
 | B5 | Reproducible join demo and performance baseline | Pending | B4 | — |
 | B6 | Persistent shuffle storage | Pending | B5 | — |
 | B7 | Worker-loss recovery | Pending | B6 | — |
 
-Continue with **B2**. Each milestone is a reviewable change; split it into smaller commits when needed.
+Continue with **B3**. Each milestone is a reviewable change; split it into smaller commits when needed.
 Statuses are Next, In progress, Blocked, Pending, and Done. Only mark Done after the exit criterion
 passes and its commit/test evidence is recorded above. The checked baseline describes prior local
 verification; it does not imply that checks have been rerun today.
@@ -43,12 +43,12 @@ aggregates above joins from this first slice; document their rejection.
 
 Primary files: `src/cluster/worker.rs`, `src/cluster/coordinator.rs`, `tests/remote.rs`.
 
-- [ ] Publish hash-routed blocks from both producer stages.
-- [ ] Wait for both dependencies and assign only matching destination blocks to each join task.
-- [ ] Materialize the two dependencies separately and execute the existing native hash join.
-- [ ] Collect all join outputs and clean up both inputs after downstream execution completes.
-- [ ] Add remote/native parity tests using multiple workers and unequal input partition counts.
-- [ ] Verify duplicate keys preserve many-to-many SQL row multiplicity.
+- [x] Publish hash-routed blocks from both producer stages.
+- [x] Wait for both dependencies and assign only matching destination blocks to each join task.
+- [x] Materialize the two dependencies separately and execute the existing native hash join.
+- [x] Collect all join outputs and clean up both inputs after downstream execution completes.
+- [x] Add remote/native parity tests using multiple workers and unequal input partition counts.
+- [x] Verify duplicate keys preserve many-to-many SQL row multiplicity.
 
 Exit: a remote inner join over two partitioned tables matches native results as an unordered
 multiset, with no missing or duplicate output caused by task routing.

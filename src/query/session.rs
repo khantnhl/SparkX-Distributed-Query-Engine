@@ -241,6 +241,24 @@ impl Session {
                 task_count,
                 2,
             )
+        } else if let Some(graph) =
+            crate::cluster::join::plan_remote_join(physical.as_ref(), query_id.clone())?
+        {
+            let task_count = graph.iter().try_fold(0_u32, |count, stage| {
+                count
+                    .checked_add(stage.partition_count)
+                    .ok_or_else(|| SparkXError::planning("remote join task count overflowed"))
+            })?;
+            let result = RemoteStageRunner::new(remote)?
+                .execute_graph(graph, StageId(2), cancellation)
+                .await?;
+            (
+                result.batches,
+                result.intermediate_blocks,
+                result.cleanup_errors,
+                task_count,
+                3,
+            )
         } else {
             let partition_count = remote_partition_count(physical.as_ref())?;
             let stage = StagePlan::from_physical_plan(
