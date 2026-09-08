@@ -12,14 +12,14 @@ output survive failures. This is the execution checklist for the distributed wor
 |---|---|---|---|---|
 | B0 | Hash-partitioned aggregate exchange and source organization | Done | — | Commit `34ef3cf`; 75 tests, Clippy, and formatting passed during implementation |
 | B1 | Remote join plan and exchange contracts | Done | B0 | `168b657`; `tests/remote_join_plan.rs`: 2 passed |
-| B2 | Remote inner hash join | Done | B1 | `tests/remote_joins.rs`: multi-worker parity passed |
-| B3 | Left joins and SQL edge cases | Next | B2 | — |
-| B4 | Resource limits and failure handling | Pending | B3 | — |
+| B2 | Remote inner hash join | Done | B1 | `962849c`; `tests/remote_joins.rs`: multi-worker parity passed |
+| B3 | Left joins and SQL edge cases | Done | B2 | Seven remote/native/DuckDB cases passed |
+| B4 | Resource limits and failure handling | In progress | B3 | — |
 | B5 | Reproducible join demo and performance baseline | Pending | B4 | — |
 | B6 | Persistent shuffle storage | Pending | B5 | — |
 | B7 | Worker-loss recovery | Pending | B6 | — |
 
-Continue with **B3**. Each milestone is a reviewable change; split it into smaller commits when needed.
+Continue with **B4**. Each milestone is a reviewable change; split it into smaller commits when needed.
 Statuses are Next, In progress, Blocked, Pending, and Done. Only mark Done after the exit criterion
 passes and its commit/test evidence is recorded above. The checked baseline describes prior local
 verification; it does not imply that checks have been rerun today.
@@ -57,11 +57,11 @@ multiset, with no missing or duplicate output caused by task routing.
 
 Primary files: `src/runtime/execution.rs`, `tests/remote.rs`, `tests/sql_differential.rs`.
 
-- [ ] Support left equi-joins and preserve unmatched left rows exactly once.
-- [ ] Test compound keys and NULL keys; NULL join keys must not match each other.
-- [ ] Test empty left input, empty right input, empty destination partitions, and no matching keys.
-- [ ] Test aliases, projections, filters, and duplicate keys against native execution and DuckDB.
-- [ ] Keep unsupported join types and query compositions rejected before submission.
+- [x] Support left equi-joins and preserve unmatched left rows exactly once.
+- [x] Test compound keys and NULL keys; NULL join keys must not match each other.
+- [x] Test empty left input, empty right input, empty destination partitions, and no matching keys.
+- [x] Test aliases, projections, filters, and duplicate keys against native execution and DuckDB.
+- [x] Keep unsupported join types and query compositions rejected before submission.
 
 Exit: the supported remote join corpus agrees with native execution and DuckDB, including row
 multiplicity and NULL placement. Queries without ORDER BY must not depend on output ordering.
