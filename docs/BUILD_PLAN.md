@@ -13,13 +13,13 @@ output survive failures. This is the execution checklist for the distributed wor
 | B0 | Hash-partitioned aggregate exchange and source organization | Done | — | Commit `34ef3cf`; 75 tests, Clippy, and formatting passed during implementation |
 | B1 | Remote join plan and exchange contracts | Done | B0 | `168b657`; `tests/remote_join_plan.rs`: 2 passed |
 | B2 | Remote inner hash join | Done | B1 | `962849c`; `tests/remote_joins.rs`: multi-worker parity passed |
-| B3 | Left joins and SQL edge cases | Done | B2 | Seven remote/native/DuckDB cases passed |
-| B4 | Resource limits and failure handling | In progress | B3 | — |
-| B5 | Reproducible join demo and performance baseline | Pending | B4 | — |
+| B3 | Left joins and SQL edge cases | Done | B2 | `ec0cb97`; Seven remote/native/DuckDB cases passed |
+| B4 | Resource limits and failure handling | Done | B3 | Distributed lifecycle, stalled-connection, and skew/memory tests passed |
+| B5 | Reproducible join demo and performance baseline | In progress | B4 | — |
 | B6 | Persistent shuffle storage | Pending | B5 | — |
 | B7 | Worker-loss recovery | Pending | B6 | — |
 
-Continue with **B4**. Each milestone is a reviewable change; split it into smaller commits when needed.
+Continue with **B5**. Each milestone is a reviewable change; split it into smaller commits when needed.
 Statuses are Next, In progress, Blocked, Pending, and Done. Only mark Done after the exit criterion
 passes and its commit/test evidence is recorded above. The checked baseline describes prior local
 verification; it does not imply that checks have been rerun today.
@@ -70,11 +70,11 @@ multiplicity and NULL placement. Queries without ORDER BY must not depend on out
 
 Primary files: `src/cluster/hash_exchange.rs`, `src/cluster/worker.rs`, `src/cluster/remote.rs`, `tests/memory.rs`.
 
-- [ ] Account for both materialized inputs, routing buffers, join state, and retained output.
-- [ ] Test hot-key skew and small memory limits; return a typed error and release reservations.
-- [ ] Propagate cancellation and deadlines through dependency fetch, join execution, and output upload.
-- [ ] Test missing/corrupt blocks, failed uploads, rejected commits, and stale task attempts.
-- [ ] Ensure downstream failure cancels outstanding query work and cleans up known blocks where reachable.
+- [x] Account for both materialized inputs, routing buffers, join state, and retained output.
+- [x] Test hot-key skew and small memory limits; return a typed error and release reservations.
+- [x] Propagate cancellation and deadlines through dependency fetch, join execution, and output upload.
+- [x] Test missing/corrupt blocks, failed uploads, rejected commits, and stale task attempts.
+- [x] Ensure downstream failure cancels outstanding query work and cleans up known blocks where reachable.
 
 Exit: injected failures terminate within the configured deadline, release task resources, and never
 report partial results as a successful query. Record unreachable-worker cleanup limitations explicitly.
@@ -124,3 +124,7 @@ commit or PR plus verification evidence. Use [CONTRIBUTING.md](../CONTRIBUTING.m
 |---|---|---|---|
 | 2026-09-08 | B0 | Existing implementation recorded as baseline | `34ef3cf`; prior local verification reported above |
 | 2026-09-08 | B1–B7 | Build plan created; implementation has not started | B1 is next |
+
+Failure cleanup is best-effort with a two-second grace period. Unreachable workers and uploads whose
+acknowledgements were lost can retain orphan blocks; persistent-store retention is tracked in B6.
+Arrow decoding can transiently allocate one batch before its reservation is charged.

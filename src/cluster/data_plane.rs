@@ -292,6 +292,17 @@ impl FlightDataPlaneClient {
     }
 
     pub async fn download_with_schema(&mut self, block: &ShuffleBlock) -> Result<DownloadedBlock> {
+        let memory = crate::QueryMemory::new(u64::MAX);
+        self.download_reserved(block, &mut memory.try_reserve(0)?)
+            .await
+    }
+
+    /// Charge decoded batches before retaining them in the download buffer.
+    pub async fn download_reserved(
+        &mut self,
+        block: &ShuffleBlock,
+        reservation: &mut crate::MemoryReservation,
+    ) -> Result<DownloadedBlock> {
         let (endpoint, ticket) = match &block.location {
             ShuffleLocation::Flight {
                 endpoint, ticket, ..
@@ -315,7 +326,9 @@ impl FlightDataPlaneClient {
             .map_err(|error| map_flight_error("download block", error))?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.next().await {
-            batches.push(batch.map_err(|error| map_flight_error("read block", error))?);
+            let batch = batch.map_err(|error| map_flight_error("read block", error))?;
+            reservation.try_grow(batch.get_array_memory_size() as u64)?;
+            batches.push(batch);
         }
         let schema = stream
             .schema()

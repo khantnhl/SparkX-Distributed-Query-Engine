@@ -524,3 +524,27 @@ async fn session_rejects_unsupported_global_remote_sql_before_submission() {
         SparkXError::Unsupported(message) if message.contains("unsupported repartitioning")
     ));
 }
+
+#[tokio::test]
+async fn remote_deadline_bounds_a_stalled_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stalled = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            sockets.push(listener.accept().await.unwrap().0);
+        }
+    });
+    let mut config = RemoteStageConfig::new(endpoint);
+    config.timeout = Duration::from_millis(30);
+    let runner = RemoteStageRunner::new(config).unwrap();
+    let provider = Arc::new(MemoryTable::from_batches(vec![batch(vec![1])], 1).unwrap());
+    let started = std::time::Instant::now();
+    let error = runner
+        .execute(stage("stalled", provider, 1), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timeout"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    stalled.abort();
+}

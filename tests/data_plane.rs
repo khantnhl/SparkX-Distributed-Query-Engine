@@ -129,3 +129,34 @@ async fn preserves_the_schema_for_empty_output() {
     assert!(client.download(&block).await.unwrap().is_empty());
     server.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn download_accounts_memory_and_releases_it_on_error() {
+    let server = FlightDataPlaneServer::start_loopback(1_000_000)
+        .await
+        .unwrap();
+    let mut client = FlightDataPlaneClient::connect(server.endpoint())
+        .await
+        .unwrap();
+    let input = batches();
+    let block = client
+        .upload(
+            WorkerId::new("reserved").unwrap(),
+            task(),
+            PartitionId(0),
+            input[0].schema(),
+            input,
+        )
+        .await
+        .unwrap();
+    let memory = sparkx::QueryMemory::new(1);
+    let mut reservation = memory.try_reserve(0).unwrap();
+    assert!(matches!(
+        client.download_reserved(&block, &mut reservation).await,
+        Err(SparkXError::ResourceExhausted(_))
+    ));
+    drop(reservation);
+    assert_eq!(memory.reserved_bytes(), 0);
+    assert!(!client.download(&block).await.unwrap().is_empty());
+    server.close().await.unwrap();
+}

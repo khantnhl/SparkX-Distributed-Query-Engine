@@ -272,3 +272,54 @@ async fn remote_join_corpus_matches_native_and_duckdb() {
     }
     server.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn skewed_join_exhaustion_cancels_query_and_releases_worker_memory() {
+    let coordinator = Arc::new(Mutex::new(
+        Coordinator::new(CoordinatorConfig::default()).unwrap(),
+    ));
+    let server = ControlPlaneServer::start_loopback(coordinator.clone())
+        .await
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1; 200]))]).unwrap();
+    let provider = Arc::new(MemoryTable::from_batches(vec![batch], 1).unwrap());
+    let catalog = Arc::new(Catalog::default());
+    catalog.register("a", provider.clone());
+    catalog.register("b", provider.clone());
+    let session = Session::new(SessionConfig::default());
+    session.register_table("a", provider.clone());
+    session.register_table("b", provider);
+    let stop = CancellationToken::new();
+    let mut config = WorkerConfig::new(server.endpoint(), WorkerId::new("skew").unwrap());
+    config.memory_bytes = 64 * 1024;
+    config.poll_interval = Duration::from_millis(5);
+    let handle = tokio::spawn(
+        RemoteWorker::new(config, catalog)
+            .unwrap()
+            .run_until(stop.clone()),
+    );
+    let query = QueryId::new("skew-limit").unwrap();
+    let error = session
+        .execute_sql_remote(
+            "SELECT a.id, b.id FROM a JOIN b ON a.id = b.id",
+            query.clone(),
+            RemoteStageConfig::new(server.endpoint()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("resource exhausted"), "{error}");
+    assert_eq!(
+        coordinator
+            .lock()
+            .await
+            .stage_status(&query, StageId(2))
+            .unwrap(),
+        sparkx::coordinator::StageStatus::Cancelled
+    );
+    stop.cancel();
+    let summary = handle.await.unwrap().unwrap();
+    assert_eq!(summary.metrics.memory_reserved_bytes, 0);
+    server.close().await.unwrap();
+}

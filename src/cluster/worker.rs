@@ -4,7 +4,7 @@ use crate::cancellation::CancellationToken;
 use crate::catalog::{Catalog, MemoryTable};
 use crate::control_plane::ControlPlaneClient;
 use crate::data_plane::{FlightDataPlaneClient, FlightDataPlaneServer};
-use crate::execution::{TaskContext, execute};
+use crate::execution::{TaskContext, collect_with_memory, execute};
 use crate::memory::{MemoryReservation, QueryMemory};
 use crate::metrics::{MetricsSnapshot, QueryMetrics};
 use crate::protocol::{
@@ -364,7 +364,10 @@ async fn execute_assignment(assignment: TaskAssignmentExecution) -> TaskCompleti
         data_endpoint,
     } = assignment;
     context.partition = Some(task.partition_id.0 as usize);
-    let result = async {
+    let cancellation = context.cancellation.clone();
+    let mut blocks = Vec::new();
+    let deadline = Duration::from_millis(lease.expires_at_ms.saturating_sub(current_time_ms()));
+    let work = async {
         context.cancellation.check()?;
         let (task_catalog, _input_reservation) = materialize_stage_inputs(
             catalog.as_ref(),
@@ -379,14 +382,10 @@ async fn execute_assignment(assignment: TaskAssignmentExecution) -> TaskCompleti
         }
         let plan = stage.decode_physical_plan(&task_catalog)?;
         let schema = plan.schema();
-        let batches = execute(plan, context.clone()).collect().await?;
+        let (batches, _output_reservation) =
+            collect_with_memory(execute(plan, context.clone()), &context.memory).await?;
         context.cancellation.check()?;
         let mut data_client = FlightDataPlaneClient::connect(data_endpoint).await?;
-        let mut blocks = Vec::new();
-        let mut reservation = context.memory.try_reserve(0)?;
-        for batch in &batches {
-            reservation.try_grow(batch.get_array_memory_size() as u64)?;
-        }
         let outputs = match &stage.output_exchange {
             Some(exchange) => crate::hash_exchange::repartition(
                 &schema,
@@ -414,7 +413,6 @@ async fn execute_assignment(assignment: TaskAssignmentExecution) -> TaskCompleti
             match upload {
                 Ok(block) => blocks.push(block),
                 Err(error) => {
-                    discard_output_blocks(&blocks).await;
                     return Err(error);
                 }
             }
@@ -422,10 +420,18 @@ async fn execute_assignment(assignment: TaskAssignmentExecution) -> TaskCompleti
         Ok(TaskOutput {
             rows: blocks.iter().map(|block| block.rows).sum(),
             bytes: blocks.iter().map(|block| block.bytes).sum(),
-            blocks,
+            blocks: std::mem::take(&mut blocks),
         })
+    };
+    let result = tokio::select! {
+        result = work => result,
+        _ = cancellation.cancelled() => Err(SparkXError::Cancelled),
+        _ = tokio::time::sleep(deadline) => Err(SparkXError::transport("task lease expired during execution")),
+    };
+    if result.is_err() {
+        cancellation.cancel();
+        discard_output_blocks(&blocks).await;
     }
-    .await;
     TaskCompletion {
         task,
         lease,
@@ -493,7 +499,7 @@ async fn materialize_stage_inputs(
         let downloaded = clients
             .get_mut(&endpoint)
             .expect("data-plane client was just inserted")
-            .download_with_schema(block)
+            .download_reserved(block, &mut reservation)
             .await?;
         if input
             .schema
@@ -507,7 +513,6 @@ async fn materialize_stage_inputs(
         }
         input.schema.get_or_insert(downloaded.schema);
         for batch in downloaded.batches {
-            reservation.try_grow(batch.get_array_memory_size() as u64)?;
             input.batches.push(batch);
         }
     }
@@ -556,9 +561,12 @@ async fn discard_output_blocks(blocks: &[ShuffleBlock]) {
         let ShuffleLocation::Flight { endpoint, .. } = &block.location else {
             continue;
         };
-        if let Ok(mut client) = FlightDataPlaneClient::connect(endpoint).await {
-            let _ = client.delete(block).await;
-        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            if let Ok(mut client) = FlightDataPlaneClient::connect(endpoint).await {
+                let _ = client.delete(block).await;
+            }
+        })
+        .await;
     }
 }
 

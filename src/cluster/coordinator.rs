@@ -615,10 +615,12 @@ impl Coordinator {
             .stages
             .get(&(query_id.clone(), stage_id))
             .ok_or_else(|| stage_not_found(query_id, stage_id))?;
-        if !stage
-            .partitions
-            .iter()
-            .all(|partition| matches!(partition, PartitionRuntime::Succeeded { .. }))
+        // Cancelled queries expose already committed blocks for best-effort cleanup.
+        if !self.cancelled_queries.contains_key(query_id)
+            && !stage
+                .partitions
+                .iter()
+                .all(|partition| matches!(partition, PartitionRuntime::Succeeded { .. }))
         {
             return Err(coordinator_error(format!(
                 "query {} stage {} has not succeeded",

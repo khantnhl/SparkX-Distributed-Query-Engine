@@ -89,6 +89,56 @@ impl RemoteStageRunner {
         final_stage_id: crate::protocol::StageId,
         cancellation: CancellationToken,
     ) -> Result<RemoteStageResult> {
+        let result = tokio::select! {
+            result = self.execute_graph_once(stages.clone(), final_stage_id, cancellation.clone()) => result,
+            _ = cancellation.cancelled() => Err(SparkXError::Cancelled),
+            _ = tokio::time::sleep(self.config.timeout) => Err(SparkXError::execution("remote query exceeded its timeout")),
+        };
+        if result.is_err() {
+            // Cleanup has its own small, bounded grace period even when the query deadline elapsed.
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.cancel_and_cleanup(&stages))
+                .await;
+        }
+        result
+    }
+
+    async fn cancel_and_cleanup(&self, stages: &[StagePlan]) {
+        let Some(first) = stages.first() else {
+            return;
+        };
+        let Ok(mut control) =
+            ControlPlaneClient::connect(self.config.coordinator_endpoint.clone()).await
+        else {
+            return;
+        };
+        let _ = control
+            .cancel_query(first.query_id.clone(), "remote query failed or stopped")
+            .await;
+        for stage in stages {
+            if let Ok(blocks) = control
+                .stage_output_blocks(first.query_id.clone(), stage.stage_id)
+                .await
+            {
+                for block in blocks {
+                    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+                        if let Ok(endpoint) = flight_endpoint(&block) {
+                            if let Ok(mut client) = FlightDataPlaneClient::connect(endpoint).await {
+                                let _ = client.delete(&block).await;
+                            }
+                        }
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn execute_graph_once(
+        &self,
+        stages: Vec<StagePlan>,
+        final_stage_id: crate::protocol::StageId,
+        cancellation: CancellationToken,
+    ) -> Result<RemoteStageResult> {
         cancellation.check()?;
         let query_id = stages
             .first()
