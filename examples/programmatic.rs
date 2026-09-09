@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
         )?,
     );
 
-    let result = session    
+    let result = session
         .execute_sql(
             "SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue FROM orders GROUP BY region",
         )

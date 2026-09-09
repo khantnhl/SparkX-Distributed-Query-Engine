@@ -145,7 +145,6 @@ process-kill testing and coordinator restart recovery remain future work. B5's h
 not block implementing the later milestones; it remains a release verification requirement.
 
 Final local verification (2026-09-08): 88 tests passed with `cargo test --locked --offline --all-targets`;
-`cargo clippy --locked --offline --all-targets --all-features -- -D warnings` passed. Rustfmt checks
-passed for library modules, binaries, tests, benchmark, and the new example. The pre-existing user
-whitespace edit in `examples/programmatic.rs` and the user's `rust-toolchain.toml` change are not included
-in the build commits. Hosted CI has not run because these commits have not been pushed.
+`cargo clippy --locked --offline --all-targets --all-features -- -D warnings` passed. Rustfmt checks passed across all targets. The user's compatible rust-analyzer toolchain setting
+was included in the final recovery commit; a follow-up formatting commit removes trailing whitespace
+from the example. Hosted CI has not run because these commits have not been pushed.
