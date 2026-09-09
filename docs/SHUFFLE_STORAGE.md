@@ -45,3 +45,34 @@ and rename guarantees depend on the host filesystem; do not treat this as replic
 Verification: `tests/data_plane.rs` closes and reopens the service, reuses original manifests, verifies
 deletions, rejects concurrent directory owners, and injects interrupted writes, corruption, and
 capacity exhaustion.
+
+## Worker-loss recovery
+
+Task leases already retry abandoned consumers using the same committed dependency manifests. If a
+producer's output is unavailable and task retries are exhausted, opt into whole-query recomputation:
+
+```sh
+cargo run --locked --bin sparkx -- --input examples/data/orders.csv --table orders \
+  --register customers=examples/data/customers.csv \
+  --sql "SELECT orders.order_id, customers.name FROM orders LEFT JOIN customers ON orders.customer_id = customers.customer_id" \
+  --remote-coordinator http://127.0.0.1:50051 --remote-retries 1 --metrics
+```
+
+The default is zero whole-query retries. Keep source contents and partitioning unchanged until the
+query finishes. A recoverable transport/missing-output failure cancels the old graph, attempts bounded
+cleanup, and resubmits all stages under a fresh query ID. This deliberately recomputes the whole graph
+instead of attempting partial lineage repair. Old leases and tickets cannot commit into the new query.
+The original query deadline applies across all retries; cleanup adds at most a two-second grace period
+per failed attempt. Memory, semantic, and checksum errors are not retried as availability failures.
+
+`QueryResult.recovery_attempts` and CLI metrics report whole-query retries. Task/shuffle metrics describe
+the final successful graph and do not total work from failed graphs. Committed inputs are reused for
+ordinary consumer lease retries, while a whole-query retry invalidates the old graph's manifests.
+A restarted storage service can also serve original manifests if its identity and endpoint are stable.
+
+Protocol version **5** carries terminal task retryability. Use matching coordinator/worker/client builds;
+old persisted block versions are rejected. Coordinator restart and loss of every source copy remain
+outside this recovery model. `tests/remote_recovery.rs` closes a producer's data service, abandons a
+consumer lease, and checks successful recovery and bounded failure when retries are disabled. The
+join SQL corpus provides the supported query shapes; these are deterministic local service drills,
+not a claim of completed multi-host chaos testing.

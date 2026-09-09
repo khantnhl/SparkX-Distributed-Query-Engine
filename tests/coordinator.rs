@@ -376,6 +376,7 @@ fn retries_expired_leases_and_rejects_stale_attempt_updates() {
         PartitionStatus::Failed {
             attempt: 1,
             error: "transient read failure".to_owned(),
+            retryable: true,
         }
     );
     assert!(coordinator.next_assignment(13).unwrap().is_none());

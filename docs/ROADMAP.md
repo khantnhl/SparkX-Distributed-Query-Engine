@@ -100,8 +100,9 @@ stage/partition status, propagates timeout/cancellation, and collects verified o
 partition-local scan/filter/projection SQL now uses that runner. Top-level non-distinct aggregates
 over join-free inputs now form a two-stage remote graph: first-stage workers publish partial states,
 the coordinator routes manifests to dependent tasks, and final workers fetch their partitions over
-Flight into bounded query memory before merging. Grouped aggregates now hash-partition partial states for parallel downstream merges. Durable shuffle
-and exchange planning for joins and sorting remain open.
+Flight into bounded query memory before merging. Grouped aggregates now hash-partition partial states for parallel downstream merges. Remote inner/left equi-joins, worker-local persistent shuffle, and opt-in whole-query recovery now
+exist. Replicated/object-store shuffle and exchange planning for sorting remain open. See the
+[storage and recovery contract](SHUFFLE_STORAGE.md).
 
 Split the current `LocalCluster` seam into:
 

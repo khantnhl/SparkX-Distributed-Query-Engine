@@ -59,6 +59,10 @@ struct Args {
     #[arg(long, default_value_t = 300_000, requires = "remote_coordinator")]
     remote_timeout_ms: u64,
 
+    /// Whole-query recomputation attempts after unavailable shuffle output. Inputs must stay unchanged.
+    #[arg(long, default_value_t = 0, requires = "remote_coordinator")]
+    remote_retries: u32,
+
     /// Retain verified remote output blocks instead of deleting them after collection.
     #[arg(long, requires = "remote_coordinator")]
     keep_remote_output: bool,
@@ -170,6 +174,7 @@ async fn run() -> Result<()> {
         let mut remote = RemoteStageConfig::new(endpoint.clone());
         remote.timeout = Duration::from_millis(args.remote_timeout_ms);
         remote.delete_output_after_fetch = !args.keep_remote_output;
+        remote.max_query_retries = args.remote_retries;
         let query_id = match &args.remote_query_id {
             Some(query_id) => QueryId::new(query_id.clone())?,
             None => generated_query_id()?,
@@ -196,6 +201,7 @@ async fn run() -> Result<()> {
         println!("== Physical Plan ==\n{}", result.physical_plan);
     }
     if args.metrics {
+        println!("query recovery attempts: {}", result.recovery_attempts);
         println!(
             "\n{}",
             serde_json::to_string_pretty(&result.metrics)

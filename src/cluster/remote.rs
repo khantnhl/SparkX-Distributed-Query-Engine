@@ -18,6 +18,9 @@ pub struct RemoteStageConfig {
     pub poll_interval: Duration,
     pub timeout: Duration,
     pub delete_output_after_fetch: bool,
+    /// Recompute the graph under a new query identity after a recoverable failure.
+    /// Inputs must remain unchanged for the entire query, including retries.
+    pub max_query_retries: u32,
 }
 
 impl RemoteStageConfig {
@@ -27,6 +30,7 @@ impl RemoteStageConfig {
             poll_interval: Duration::from_millis(50),
             timeout: Duration::from_secs(300),
             delete_output_after_fetch: true,
+            max_query_retries: 0,
         }
     }
 
@@ -55,6 +59,7 @@ pub struct RemoteStageResult {
     pub intermediate_blocks: Vec<ShuffleBlock>,
     /// Cleanup is best-effort after every block has been fetched and verified.
     pub cleanup_errors: Vec<String>,
+    pub recovery_attempts: u32,
 }
 
 impl RemoteStageResult {
@@ -89,17 +94,41 @@ impl RemoteStageRunner {
         final_stage_id: crate::protocol::StageId,
         cancellation: CancellationToken,
     ) -> Result<RemoteStageResult> {
-        let result = tokio::select! {
-            result = self.execute_graph_once(stages.clone(), final_stage_id, cancellation.clone()) => result,
-            _ = cancellation.cancelled() => Err(SparkXError::Cancelled),
-            _ = tokio::time::sleep(self.config.timeout) => Err(SparkXError::execution("remote query exceeded its timeout")),
-        };
-        if result.is_err() {
-            // Cleanup has its own small, bounded grace period even when the query deadline elapsed.
-            let _ = tokio::time::timeout(Duration::from_secs(2), self.cancel_and_cleanup(&stages))
-                .await;
+        let deadline = Instant::now() + self.config.timeout;
+        let mut stages = stages;
+        for attempt in 0..=self.config.max_query_retries {
+            let result = tokio::select! {
+                result = self.execute_graph_once(stages.clone(), final_stage_id, cancellation.clone()) => result,
+                _ = cancellation.cancelled() => Err(SparkXError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => Err(SparkXError::execution("remote query exceeded its timeout")),
+            };
+            match result {
+                Ok(mut output) => {
+                    output.recovery_attempts = attempt;
+                    return Ok(output);
+                }
+                Err(error) => {
+                    // Invalidate the old graph before any recomputation; old attempts cannot commit into the new query.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        self.cancel_and_cleanup(&stages),
+                    )
+                    .await;
+                    if attempt == self.config.max_query_retries
+                        || Instant::now() >= deadline
+                        || cancellation.is_cancelled()
+                        || !matches!(error, SparkXError::Transport(_) | SparkXError::NotFound(_))
+                    {
+                        return Err(error);
+                    }
+                    let query = recovery_query_id()?;
+                    for stage in &mut stages {
+                        stage.query_id = query.clone();
+                    }
+                }
+            }
         }
-        result
+        unreachable!("retry loop always returns")
     }
 
     async fn cancel_and_cleanup(&self, stages: &[StagePlan]) {
@@ -197,18 +226,23 @@ impl RemoteStageRunner {
                 {
                     StageStatus::Succeeded => {}
                     StageStatus::Failed => {
-                        let details = failed_partition_details(
+                        let (details, retryable) = failed_partition_details(
                             &mut control,
                             &query_id,
                             stage.stage_id,
                             stage.partition_count,
                         )
                         .await?;
-                        return Err(SparkXError::execution(format!(
+                        let message = format!(
                             "remote query {} stage {} failed{details}",
                             query_id.as_str(),
                             stage.stage_id.0
-                        )));
+                        );
+                        return Err(if retryable {
+                            SparkXError::transport(message)
+                        } else {
+                            SparkXError::execution(message)
+                        });
                     }
                     StageStatus::Cancelled => return Err(SparkXError::Cancelled),
                     StageStatus::Blocked | StageStatus::Ready | StageStatus::Running => {
@@ -315,6 +349,7 @@ impl RemoteStageRunner {
             output_blocks: blocks,
             intermediate_blocks,
             cleanup_errors,
+            recovery_attempts: 0,
         })
     }
 }
@@ -324,20 +359,31 @@ async fn failed_partition_details(
     query_id: &crate::protocol::QueryId,
     stage_id: crate::protocol::StageId,
     partition_count: u32,
-) -> Result<String> {
+) -> Result<(String, bool)> {
+    let mut retryable_failure = false;
+    let mut nonretryable_failure = false;
     let mut failures = Vec::new();
     for partition in 0..partition_count {
-        if let PartitionStatus::Failed { attempt, error } = control
+        if let PartitionStatus::Failed {
+            attempt,
+            error,
+            retryable,
+        } = control
             .partition_status(query_id.clone(), stage_id, PartitionId(partition))
             .await?
         {
+            retryable_failure |= retryable;
+            nonretryable_failure |= !retryable;
             failures.push(format!("partition {partition} attempt {attempt}: {error}"));
         }
     }
     if failures.is_empty() {
-        Ok(String::new())
+        Ok((String::new(), false))
     } else {
-        Ok(format!(": {}", failures.join("; ")))
+        Ok((
+            format!(": {}", failures.join("; ")),
+            retryable_failure && !nonretryable_failure,
+        ))
     }
 }
 
@@ -369,4 +415,17 @@ fn merge_download(
     }
     batches.extend(downloaded.batches);
     Ok(())
+}
+
+fn recovery_query_id() -> Result<crate::protocol::QueryId> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| SparkXError::execution(error.to_string()))?
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::protocol::QueryId::new(format!(
+        "recovery-{}-{timestamp}-{sequence}",
+        std::process::id()
+    ))
 }

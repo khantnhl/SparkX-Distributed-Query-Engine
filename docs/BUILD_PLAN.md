@@ -15,12 +15,12 @@ output survive failures. This is the execution checklist for the distributed wor
 | B2 | Remote inner hash join | Done | B1 | `962849c`; `tests/remote_joins.rs`: multi-worker parity passed |
 | B3 | Left joins and SQL edge cases | Done | B2 | `ec0cb97`; Seven remote/native/DuckDB cases passed |
 | B4 | Resource limits and failure handling | Done | B3 | `d0698d0`; Distributed lifecycle, stalled-connection, and skew/memory tests passed |
-| B5 | Reproducible join demo and performance baseline | In progress | B4 | `402fdcd`; release baseline and CLI test passed; hosted CI pending |
-| B6 | Persistent shuffle storage | Done | B5 | Six data-plane tests passed, including restart/corruption/capacity |
-| B7 | Worker-loss recovery | In progress | B6 | — |
+| B5 | Reproducible join demo and performance baseline | Awaiting CI | B4 | `402fdcd`; release baseline and CLI test passed; hosted CI pending |
+| B6 | Persistent shuffle storage | Done | B5 | `5ab4064`; Six data-plane tests passed, including restart/corruption/capacity |
+| B7 | Worker-loss recovery | Done | B6 | Three producer/consumer-loss drills passed; opt-in graph retries |
 
-Continue with **B5**. Each milestone is a reviewable change; split it into smaller commits when needed.
-Statuses are Next, In progress, Blocked, Pending, and Done. Only mark Done after the exit criterion
+Implementation is complete through **B7**. B5 still awaits hosted CI; final local checks are recorded below. Each milestone is a reviewable change; split it into smaller commits when needed.
+Statuses are Next, In progress, Awaiting CI, Blocked, Pending, and Done. Only mark Done after the exit criterion
 passes and its commit/test evidence is recorded above. The checked baseline describes prior local
 verification; it does not imply that checks have been rerun today.
 
@@ -87,7 +87,8 @@ Primary files: `README.md`, `docs/SQL_SUPPORT.md`, `docs/ARCHITECTURE.md`, `docs
 - [x] Update the SQL support matrix, stage diagram, and current limitations.
 - [x] Benchmark native versus remote joins with uniform and skewed keys; record machine, data size, partition count, and commands.
 - [x] Record elapsed time, rows, shuffle volume, and available memory metrics without claiming unavailable cross-worker metrics.
-- [ ] Run formatting, Clippy, the complete test suite, and CI on supported platforms. Local verification runs at the end of this build; hosted CI requires a push.
+- [x] Run formatting on changed Rust files, Clippy, and the complete local test suite: 88 tests passed.
+- [ ] Verify hosted CI on Linux, Windows, and macOS after pushing the commits.
 
 Exit: another contributor can reproduce the join results and benchmark baseline using the checked-in
 instructions. A speedup is not required; correctness and honest measurements are.
@@ -105,11 +106,11 @@ appear as successful outputs. Prove durability with restart tests rather than in
 
 ## B7 — Recover from worker loss
 
-- [ ] Define when to reuse a committed block and when to recompute its producer stage.
-- [ ] Invalidate unavailable dependency manifests and reschedule affected work.
-- [ ] Fence stale attempts and prevent retries from publishing duplicate logical output.
-- [ ] Kill producers and consumers during a multi-worker query and verify recovery or a bounded terminal error.
-- [ ] Add a small supported decision-support query corpus for repeatable failure drills.
+- [x] Define when to reuse a committed block and when to recompute its producer stage.
+- [x] Invalidate unavailable dependency manifests and reschedule affected work.
+- [x] Fence stale attempts and prevent retries from publishing duplicate logical output.
+- [x] Kill producers and consumers during a multi-worker query and verify recovery or a bounded terminal error.
+- [x] Add a small supported decision-support query corpus for repeatable failure drills.
 
 Exit: recoverable worker failures produce the same result as a failure-free run within the retry
 budget; unrecoverable failures terminate clearly. Coordinator restart recovery remains separate work.
@@ -128,3 +129,23 @@ commit or PR plus verification evidence. Use [CONTRIBUTING.md](../CONTRIBUTING.m
 Failure cleanup is best-effort with a two-second grace period. Unreachable workers and uploads whose
 acknowledgements were lost can retain orphan blocks; persistent-store retention is tracked in B6.
 Arrow decoding can transiently allocate one batch before its reservation is charged.
+
+
+2026-09-08 build notes:
+- B1 `168b657`: deterministic remote join graph and compatible exchange keys.
+- B2 `962849c`: multi-worker inner join execution and duplicate-key parity.
+- B3 `ec0cb97`: left/compound/NULL/empty-input corpus compared with native execution and DuckDB.
+- B4 `d0698d0`: memory accounting, lease/query deadlines, and bounded failure cleanup.
+- B5 `402fdcd`: runnable CLI demo, input fixtures, and recorded release benchmark.
+- B6 `5ab4064`: persistent local blocks, atomic publication, restart verification, and directory locking.
+- B7: consumer lease reuse and optional whole-query recomputation after lost producer output.
+
+B7 drills simulate worker loss through data-service termination and abandoned leases. Multi-host
+process-kill testing and coordinator restart recovery remain future work. B5's hosted CI gate does
+not block implementing the later milestones; it remains a release verification requirement.
+
+Final local verification (2026-09-08): 88 tests passed with `cargo test --locked --offline --all-targets`;
+`cargo clippy --locked --offline --all-targets --all-features -- -D warnings` passed. Rustfmt checks
+passed for library modules, binaries, tests, benchmark, and the new example. The pre-existing user
+whitespace edit in `examples/programmatic.rs` and the user's `rust-toolchain.toml` change are not included
+in the build commits. Hosted CI has not run because these commits have not been pushed.

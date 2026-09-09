@@ -309,8 +309,8 @@ flowchart LR
 Physical-plan serialization, deterministic coordinator state, Flight control service, standalone
 processes, a bounded worker-hosted Flight output sink, partition-local remote SQL, and two-stage
 remote aggregation with worker-to-worker Flight reads now exist. Grouped aggregates now repartition intermediate blocks by Arrow-encoded group keys using CRC32
-(protocol version 4). Each downstream task receives only its destination blocks, including schema-bearing
-empty blocks. Global aggregates retain one merge task. Remote inner/left equi-joins now use two producer exchanges and partitioned downstream joins; see [remote join execution](REMOTE_JOINS.md). Durable/object-store shuffle remains separate work.
+(current protocol version 5). Each downstream task receives only its destination blocks, including schema-bearing
+empty blocks. Global aggregates retain one merge task. Remote inner/left equi-joins now use two producer exchanges and partitioned downstream joins; see [remote join execution](REMOTE_JOINS.md). Worker-local persistent shuffle and bounded query recomputation are implemented; [storage and recovery](SHUFFLE_STORAGE.md) describe the failure boundaries. Replicated/object-store shuffle remains open.
 
 ## Non-goals for version 0.1
 

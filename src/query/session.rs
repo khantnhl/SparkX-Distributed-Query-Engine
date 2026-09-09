@@ -56,6 +56,7 @@ pub struct QueryResult {
     pub distributed: bool,
     pub stages: usize,
     pub cleanup_errors: Vec<String>,
+    pub recovery_attempts: u32,
 }
 
 impl QueryResult {
@@ -191,94 +192,100 @@ impl Session {
         let metrics = QueryMetrics::default();
         let started = Instant::now();
         let aggregate = split_mergeable_aggregate(physical.as_ref())?;
-        let (batches, metric_blocks, cleanup_errors, task_count, stages) = if let Some(aggregate) =
-            aggregate
-        {
-            let partition_count = remote_partition_count_from_usize(aggregate.partition_count())?;
-            let partial_stage_id = StageId(0);
-            let final_stage_id = StageId(1);
-            let mut partial_stage = StagePlan::from_physical_plan(
-                query_id.clone(),
-                partial_stage_id,
-                Vec::new(),
-                partition_count,
-                aggregate.worker_plan(),
-            )?;
-            let merge_partitions = if aggregate.group_count() == 0 {
-                1
-            } else {
-                partition_count
-            };
-            if aggregate.group_count() > 0 {
-                partial_stage.output_exchange = Some(crate::protocol::HashExchange {
-                    columns: (0..aggregate.group_count()).collect(),
-                    partition_count: merge_partitions,
-                });
-            }
-            let final_plan = aggregate.final_worker_plan(partial_stage_id)?;
-            let mut final_stage = StagePlan::from_physical_plan(
-                query_id,
-                final_stage_id,
-                vec![partial_stage_id],
-                merge_partitions,
-                final_plan.as_ref(),
-            )?;
-            final_stage.partitioned_input = aggregate.group_count() > 0;
-            let result = RemoteStageRunner::new(remote)?
-                .execute_graph(
-                    vec![partial_stage, final_stage],
+        let (batches, metric_blocks, cleanup_errors, task_count, stages, recovery_attempts) =
+            if let Some(aggregate) = aggregate {
+                let partition_count =
+                    remote_partition_count_from_usize(aggregate.partition_count())?;
+                let partial_stage_id = StageId(0);
+                let final_stage_id = StageId(1);
+                let mut partial_stage = StagePlan::from_physical_plan(
+                    query_id.clone(),
+                    partial_stage_id,
+                    Vec::new(),
+                    partition_count,
+                    aggregate.worker_plan(),
+                )?;
+                let merge_partitions = if aggregate.group_count() == 0 {
+                    1
+                } else {
+                    partition_count
+                };
+                if aggregate.group_count() > 0 {
+                    partial_stage.output_exchange = Some(crate::protocol::HashExchange {
+                        columns: (0..aggregate.group_count()).collect(),
+                        partition_count: merge_partitions,
+                    });
+                }
+                let final_plan = aggregate.final_worker_plan(partial_stage_id)?;
+                let mut final_stage = StagePlan::from_physical_plan(
+                    query_id,
                     final_stage_id,
-                    cancellation,
+                    vec![partial_stage_id],
+                    merge_partitions,
+                    final_plan.as_ref(),
+                )?;
+                final_stage.partitioned_input = aggregate.group_count() > 0;
+                let result = RemoteStageRunner::new(remote)?
+                    .execute_graph(
+                        vec![partial_stage, final_stage],
+                        final_stage_id,
+                        cancellation,
+                    )
+                    .await?;
+                let task_count =
+                    partition_count
+                        .checked_add(merge_partitions)
+                        .ok_or_else(|| {
+                            SparkXError::execution("remote aggregate task count overflowed")
+                        })?;
+                (
+                    result.batches,
+                    result.intermediate_blocks,
+                    result.cleanup_errors,
+                    task_count,
+                    2,
+                    result.recovery_attempts,
                 )
-                .await?;
-            let task_count = partition_count
-                .checked_add(merge_partitions)
-                .ok_or_else(|| SparkXError::execution("remote aggregate task count overflowed"))?;
-            (
-                result.batches,
-                result.intermediate_blocks,
-                result.cleanup_errors,
-                task_count,
-                2,
-            )
-        } else if let Some(graph) =
-            crate::cluster::join::plan_remote_join(physical.as_ref(), query_id.clone())?
-        {
-            let task_count = graph.iter().try_fold(0_u32, |count, stage| {
-                count
-                    .checked_add(stage.partition_count)
-                    .ok_or_else(|| SparkXError::planning("remote join task count overflowed"))
-            })?;
-            let result = RemoteStageRunner::new(remote)?
-                .execute_graph(graph, StageId(2), cancellation)
-                .await?;
-            (
-                result.batches,
-                result.intermediate_blocks,
-                result.cleanup_errors,
-                task_count,
-                3,
-            )
-        } else {
-            let partition_count = remote_partition_count(physical.as_ref())?;
-            let stage = StagePlan::from_physical_plan(
-                query_id,
-                StageId(0),
-                Vec::new(),
-                partition_count,
-                physical.as_ref(),
-            )?;
-            let result = RemoteStageRunner::new(remote)?
-                .execute(stage, cancellation)
-                .await?;
-            (
-                result.batches,
-                result.output_blocks,
-                result.cleanup_errors,
-                partition_count,
-                1,
-            )
-        };
+            } else if let Some(graph) =
+                crate::cluster::join::plan_remote_join(physical.as_ref(), query_id.clone())?
+            {
+                let task_count = graph.iter().try_fold(0_u32, |count, stage| {
+                    count
+                        .checked_add(stage.partition_count)
+                        .ok_or_else(|| SparkXError::planning("remote join task count overflowed"))
+                })?;
+                let result = RemoteStageRunner::new(remote)?
+                    .execute_graph(graph, StageId(2), cancellation)
+                    .await?;
+                (
+                    result.batches,
+                    result.intermediate_blocks,
+                    result.cleanup_errors,
+                    task_count,
+                    3,
+                    result.recovery_attempts,
+                )
+            } else {
+                let partition_count = remote_partition_count(physical.as_ref())?;
+                let stage = StagePlan::from_physical_plan(
+                    query_id,
+                    StageId(0),
+                    Vec::new(),
+                    partition_count,
+                    physical.as_ref(),
+                )?;
+                let result = RemoteStageRunner::new(remote)?
+                    .execute(stage, cancellation)
+                    .await?;
+                (
+                    result.batches,
+                    result.output_blocks,
+                    result.cleanup_errors,
+                    partition_count,
+                    1,
+                    result.recovery_attempts,
+                )
+            };
         for batch in &batches {
             metrics.record_output(batch.num_rows());
         }
@@ -305,6 +312,7 @@ impl Session {
             distributed: true,
             stages,
             cleanup_errors,
+            recovery_attempts,
         })
     }
 
@@ -352,6 +360,7 @@ impl Session {
             distributed,
             stages,
             cleanup_errors: Vec::new(),
+            recovery_attempts: 0,
         })
     }
 

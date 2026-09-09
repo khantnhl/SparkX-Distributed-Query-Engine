@@ -73,11 +73,23 @@ pub enum StageStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PartitionStatus {
-    Pending { next_attempt: u32 },
-    Running { attempt: u32 },
-    Cancelling { attempt: u32 },
-    Succeeded { attempt: u32 },
-    Failed { attempt: u32, error: String },
+    Pending {
+        next_attempt: u32,
+    },
+    Running {
+        attempt: u32,
+    },
+    Cancelling {
+        attempt: u32,
+    },
+    Succeeded {
+        attempt: u32,
+    },
+    Failed {
+        attempt: u32,
+        error: String,
+        retryable: bool,
+    },
     Cancelled,
 }
 
@@ -130,6 +142,7 @@ enum PartitionRuntime {
     Failed {
         attempt: u32,
         error: String,
+        retryable: bool,
     },
     Cancelled,
 }
@@ -598,9 +611,14 @@ impl Coordinator {
             PartitionRuntime::Succeeded { task, .. } => PartitionStatus::Succeeded {
                 attempt: task.attempt,
             },
-            PartitionRuntime::Failed { attempt, error } => PartitionStatus::Failed {
+            PartitionRuntime::Failed {
+                attempt,
+                error,
+                retryable,
+            } => PartitionStatus::Failed {
                 attempt: *attempt,
                 error: error.clone(),
+                retryable: *retryable,
             },
             PartitionRuntime::Cancelled => PartitionStatus::Cancelled,
         })
@@ -839,6 +857,7 @@ impl Coordinator {
                     PartitionRuntime::Failed {
                         attempt: task.attempt,
                         error,
+                        retryable: false,
                     }
                 };
                 *partition = replacement;
@@ -930,6 +949,7 @@ fn retry_or_fail(max_task_attempts: u32, attempt: u32, error: &str) -> Partition
         PartitionRuntime::Failed {
             attempt,
             error: error.to_owned(),
+            retryable: true,
         }
     }
 }

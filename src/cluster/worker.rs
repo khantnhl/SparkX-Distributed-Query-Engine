@@ -503,7 +503,13 @@ async fn materialize_stage_inputs(
             .get_mut(&endpoint)
             .expect("data-plane client was just inserted")
             .download_reserved(block, &mut reservation)
-            .await?;
+            .await
+            .map_err(|error| match error {
+                SparkXError::NotFound(message) => {
+                    SparkXError::transport(format!("upstream block unavailable: {message}"))
+                }
+                other => other,
+            })?;
         if input
             .schema
             .as_ref()
