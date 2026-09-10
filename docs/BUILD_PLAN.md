@@ -1,6 +1,6 @@
 # SparkX build tracker
 
-Last updated: 2026-09-08
+Last updated: 2026-09-09
 
 Build target: execute remote inner and left equi-joins correctly across workers, then make shuffle
 output survive failures. This is the execution checklist for the distributed work in the
@@ -15,7 +15,7 @@ output survive failures. This is the execution checklist for the distributed wor
 | B2 | Remote inner hash join | Done | B1 | `962849c`; `tests/remote_joins.rs`: multi-worker parity passed |
 | B3 | Left joins and SQL edge cases | Done | B2 | `ec0cb97`; Seven remote/native/DuckDB cases passed |
 | B4 | Resource limits and failure handling | Done | B3 | `d0698d0`; Distributed lifecycle, stalled-connection, and skew/memory tests passed |
-| B5 | Reproducible join demo and performance baseline | Awaiting CI | B4 | `402fdcd`; release baseline and CLI test passed; hosted CI pending |
+| B5 | Reproducible join demo and performance baseline | Awaiting CI | B4 | `402fdcd`; release baseline and CLI test passed; hosted CI failed on the prior revision; lifecycle fixes verified locally, rerun pending |
 | B6 | Persistent shuffle storage | Done | B5 | `5ab4064`; Six data-plane tests passed, including restart/corruption/capacity |
 | B7 | Worker-loss recovery | Done | B6 | Three producer/consumer-loss drills passed; opt-in graph retries |
 
@@ -148,3 +148,17 @@ Final local verification (2026-09-08): 88 tests passed with `cargo test --locked
 `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` passed. Rustfmt checks passed across all targets. The user's compatible rust-analyzer toolchain setting
 was included in the final recovery commit; a follow-up formatting commit removes trailing whitespace
 from the example. Hosted CI has not run because these commits have not been pushed.
+
+
+2026-09-09 CI follow-up:
+- Hosted [run 34378634707](https://github.com/khantnhl/SparkX-Distributed-Query-Engine/actions/runs/34378634707)
+  failed on the prior revision: Linux hit cancellation/start-report ordering; Windows hit retired
+  task reports and a recovery timeout.
+- `ee40c29`: workers now tolerate retired attempts, discard their output, and keep local execution
+  capacity occupied until cleanup finishes. Cancellation still reaches workers with full slots.
+  Deterministic regression tests cover cancellation ordering and successful work after lease retirement.
+- Recovery drills now allow slower CI connection handling while retaining bounded query deadlines.
+- Local verification: all 90 tests and benchmark smoke checks passed; Clippy and formatting passed.
+  The three recovery drills also passed after their deadline adjustment.
+- B5 remains Awaiting CI until the new commits pass the hosted platform matrix. These local results
+  do not establish Windows or Linux verification.

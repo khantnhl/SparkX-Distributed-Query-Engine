@@ -31,8 +31,9 @@ async fn worker_loss(retries: u32, consumer: bool) {
     let coordinator = Arc::new(Mutex::new(
         Coordinator::new(CoordinatorConfig {
             max_task_attempts: if consumer { 2 } else { 1 },
-            heartbeat_timeout_ms: 200,
-            lease_duration_ms: 500,
+            // Leave room for slower CI hosts and platform-specific connection refusal delays.
+            heartbeat_timeout_ms: 2_000,
+            lease_duration_ms: 10_000,
             ..CoordinatorConfig::default()
         })
         .unwrap(),
@@ -92,7 +93,7 @@ async fn worker_loss(retries: u32, consumer: bool) {
         .unwrap();
     let mut config = RemoteStageConfig::new(server.endpoint());
     config.poll_interval = Duration::from_millis(5);
-    config.timeout = Duration::from_secs(5);
+    config.timeout = Duration::from_secs(30);
     config.max_query_retries = retries;
     let runner = RemoteStageRunner::new(config).unwrap();
     let handle = tokio::spawn(async move {
@@ -100,7 +101,7 @@ async fn worker_loss(retries: u32, consumer: bool) {
             .execute_graph(graph, StageId(2), CancellationToken::new())
             .await
     });
-    let assignment = tokio::time::timeout(Duration::from_secs(2), async {
+    let assignment = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(assignment) = coordinator
                 .lock()
@@ -233,7 +234,7 @@ async fn worker_loss(retries: u32, consumer: bool) {
             .unwrap()
             .run_until(stop.clone()),
     );
-    let result = tokio::time::timeout(Duration::from_secs(8), handle)
+    let result = tokio::time::timeout(Duration::from_secs(35), handle)
         .await
         .unwrap()
         .unwrap();
