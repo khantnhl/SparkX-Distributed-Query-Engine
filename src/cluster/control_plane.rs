@@ -44,6 +44,12 @@ type FlightStream<T> = BoxStream<'static, std::result::Result<T, Status>>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PollAssignmentRequest {
     worker_id: WorkerId,
+    #[serde(default = "accept_tasks_by_default")]
+    accept_tasks: bool,
+}
+
+fn accept_tasks_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,8 +213,23 @@ impl ControlPlaneClient {
         &mut self,
         worker_id: WorkerId,
     ) -> Result<Option<CoordinatorMessage>> {
+        self.poll_assignment_with_capacity(worker_id, true).await
+    }
+
+    /// Poll control messages even while local execution slots are occupied.
+    pub async fn poll_assignment_with_capacity(
+        &mut self,
+        worker_id: WorkerId,
+        accept_tasks: bool,
+    ) -> Result<Option<CoordinatorMessage>> {
         let response: PollAssignmentResponse = self
-            .call(ACTION_POLL_ASSIGNMENT, &PollAssignmentRequest { worker_id })
+            .call(
+                ACTION_POLL_ASSIGNMENT,
+                &PollAssignmentRequest {
+                    worker_id,
+                    accept_tasks,
+                },
+            )
             .await?;
         if let Some(assignment) = &response.assignment {
             assignment.validate()?;
@@ -437,6 +458,7 @@ impl FlightService for ControlPlaneFlightService {
                     .and_then(VecDeque::pop_front);
                 let assignment = match pending {
                     Some(message) => Some(message),
+                    None if !request.accept_tasks => None,
                     None => self
                         .coordinator
                         .lock()
@@ -606,6 +628,7 @@ fn map_status(error: SparkXError) -> Status {
         }
         SparkXError::NotFound(message) => Status::not_found(message),
         SparkXError::ResourceExhausted(message) => Status::resource_exhausted(message),
+        SparkXError::TaskSuperseded => Status::aborted("task attempt was superseded"),
         SparkXError::Cancelled => Status::cancelled("query was cancelled"),
         other => Status::internal(other.to_string()),
     }
@@ -618,6 +641,7 @@ fn map_flight_error(action: &str, error: FlightError) -> SparkXError {
             Code::NotFound => SparkXError::NotFound(status.message().to_owned()),
             Code::ResourceExhausted => SparkXError::resource_exhausted(status.message().to_owned()),
             Code::Cancelled => SparkXError::Cancelled,
+            Code::Aborted => SparkXError::TaskSuperseded,
             _ => SparkXError::execution(format!(
                 "control action {action} failed: {}",
                 status.message()

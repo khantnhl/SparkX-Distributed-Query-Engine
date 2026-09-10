@@ -72,6 +72,14 @@ async fn flight_control_plane_runs_worker_and_query_lifecycle() {
         .await
         .unwrap();
 
+    assert!(
+        client
+            .poll_assignment_with_capacity(worker_id.clone(), false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     let assignment = client
         .poll_assignment(worker_id.clone())
         .await
@@ -181,7 +189,7 @@ async fn flight_control_plane_runs_worker_and_query_lifecycle() {
         StageStatus::Cancelled
     );
     let worker_cancellation = client
-        .poll_assignment(worker_id.clone())
+        .poll_assignment_with_capacity(worker_id.clone(), false)
         .await
         .unwrap()
         .unwrap();

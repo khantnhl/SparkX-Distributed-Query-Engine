@@ -37,6 +37,10 @@ pub enum SparkXError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// The coordinator has already retired this task attempt. Its output must not be committed.
+    #[error("task attempt was superseded")]
+    TaskSuperseded,
+
     #[error("query was cancelled")]
     Cancelled,
 

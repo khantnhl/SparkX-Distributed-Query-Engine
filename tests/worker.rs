@@ -252,3 +252,130 @@ async fn remote_worker_acknowledges_cancellation_before_releasing_its_slot() {
     drop(coordinator);
     server.close().await.unwrap();
 }
+
+#[derive(Debug)]
+struct GatedTable {
+    batch: RecordBatch,
+    started: std::sync::atomic::AtomicBool,
+    release: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+impl TableProvider for GatedTable {
+    fn schema(&self) -> SchemaRef {
+        self.batch.schema()
+    }
+    fn partition_count(&self) -> usize {
+        1
+    }
+    fn estimated_bytes(&self) -> u64 {
+        self.batch.get_array_memory_size() as u64
+    }
+    fn scan_partition(
+        &self,
+        _: usize,
+        _: Option<&[usize]>,
+        _: usize,
+    ) -> sparkx::Result<Vec<RecordBatch>> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (released, _) = self
+            .changed
+            .wait_timeout_while(
+                self.release.lock().unwrap(),
+                Duration::from_secs(15),
+                |released| !*released,
+            )
+            .unwrap();
+        if !*released {
+            return Err(sparkx::SparkXError::execution("test gate was not released"));
+        }
+        Ok(vec![self.batch.clone()])
+    }
+}
+
+#[tokio::test]
+async fn retired_completion_does_not_stop_worker_or_count_uncommitted_output() {
+    let coordinator = Arc::new(Mutex::new(
+        Coordinator::new(CoordinatorConfig {
+            lease_duration_ms: 30_000,
+            heartbeat_timeout_ms: 60_000,
+            max_task_attempts: 1,
+            ..CoordinatorConfig::default()
+        })
+        .unwrap(),
+    ));
+    let server = ControlPlaneServer::start_loopback(coordinator.clone())
+        .await
+        .unwrap();
+    let table = Arc::new(GatedTable {
+        batch: batch(vec![1, 2]),
+        started: std::sync::atomic::AtomicBool::new(false),
+        release: std::sync::Mutex::new(false),
+        changed: std::sync::Condvar::new(),
+    });
+    let catalog = Arc::new(Catalog::default());
+    catalog.register("input", table.clone());
+    let first = QueryId::new("retired-task").unwrap();
+    let mut admin = ControlPlaneClient::connect(server.endpoint())
+        .await
+        .unwrap();
+    admin
+        .submit_stage(&stage(first.clone(), table.clone(), 1))
+        .await
+        .unwrap();
+    let worker_id = WorkerId::new("survives-retired-task").unwrap();
+    let worker = RemoteWorker::new(
+        worker_config(server.endpoint(), worker_id.clone(), Some(2)),
+        catalog.clone(),
+    )
+    .unwrap();
+    let handle = tokio::spawn(worker.run_until(CancellationToken::new()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !table.started.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("scan should enter gate");
+    // Advance only coordinator time while the task is held. No race with a sleep-based scan.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    coordinator.lock().await.advance_time(now + 30_001).unwrap();
+    assert!(matches!(
+        coordinator
+            .lock()
+            .await
+            .partition_status(&first, StageId(0), PartitionId(0))
+            .unwrap(),
+        PartitionStatus::Failed { .. }
+    ));
+    let fast = Arc::new(MemoryTable::from_batches(vec![batch(vec![9])], 1).unwrap());
+    catalog.register("input", fast.clone());
+    let second = QueryId::new("after-retired-task").unwrap();
+    admin
+        .submit_stage(&stage(second.clone(), fast, 1))
+        .await
+        .unwrap();
+    *table.release.lock().unwrap() = true;
+    table.changed.notify_all();
+    let summary = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("worker should continue after stale rejection")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.failed_tasks, 1);
+    assert_eq!(summary.completed_tasks, 1);
+    assert_eq!(summary.output_rows, 1);
+    assert_eq!(summary.metrics.memory_reserved_bytes, 0);
+    assert_eq!(
+        coordinator
+            .lock()
+            .await
+            .stage_status(&second, StageId(0))
+            .unwrap(),
+        StageStatus::Succeeded
+    );
+    server.close().await.unwrap();
+}

@@ -171,7 +171,10 @@ impl RemoteWorker {
                 }
                 _ = polling.tick(), if !stopping => {
                     if let Some(message) = client
-                        .poll_assignment(self.config.worker_id.clone())
+                        .poll_assignment_with_capacity(
+                            self.config.worker_id.clone(),
+                            active.len() < self.config.slots as usize,
+                        )
                         .await?
                     {
                         match message {
@@ -196,14 +199,19 @@ impl RemoteWorker {
                                         self.config.slots
                                     )));
                                 }
-                                client.send_worker_message(WorkerMessage::TaskUpdate {
+                                let started = client.send_worker_message(WorkerMessage::TaskUpdate {
                                     version: PROTOCOL_VERSION,
                                     worker_id: self.config.worker_id.clone(),
                                     task: task.clone(),
                                     state: TaskState::Running {
                                         started_at_ms: lease.issued_at_ms,
                                     },
-                                }).await?;
+                                }).await;
+                                match started {
+                                    Ok(()) => {}
+                                    Err(SparkXError::TaskSuperseded) => continue,
+                                    Err(error) => return Err(error),
+                                }
                                 let cancellation = CancellationToken::new();
                                 active.insert(task.clone(), cancellation.clone());
                                 tasks.spawn(execute_assignment(TaskAssignmentExecution {
@@ -289,6 +297,7 @@ impl RemoteWorker {
                             }
                         }
                     };
+                    let completed_successfully = matches!(&state, TaskState::Succeeded { .. });
                     let uncommitted_blocks = match &state {
                         TaskState::Succeeded { output_blocks, .. } => output_blocks.clone(),
                         _ => Vec::new(),
@@ -301,7 +310,13 @@ impl RemoteWorker {
                     }).await;
                     if let Err(error) = update {
                         discard_output_blocks(&uncommitted_blocks).await;
-                        return Err(error);
+                        if !matches!(error, SparkXError::TaskSuperseded) { return Err(error); }
+                        if completed_successfully {
+                            summary.completed_tasks -= 1;
+                            summary.output_rows = summary.output_rows.saturating_sub(uncommitted_blocks.iter().map(|block| block.rows).sum());
+                            summary.output_bytes = summary.output_bytes.saturating_sub(uncommitted_blocks.iter().map(|block| block.bytes).sum());
+                            summary.failed_tasks += 1;
+                        }
                     }
 
                     if self

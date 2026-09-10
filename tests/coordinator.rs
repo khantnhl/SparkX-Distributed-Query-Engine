@@ -347,7 +347,7 @@ fn retries_expired_leases_and_rejects_stale_attempt_updates() {
     };
     assert!(matches!(
         coordinator.handle_worker_message(stale_update, 11),
-        Err(SparkXError::Protocol(_))
+        Err(SparkXError::TaskSuperseded)
     ));
 
     coordinator
@@ -550,4 +550,47 @@ fn hash_exchange_routes_only_matching_destination_blocks() {
         assert_eq!(input_blocks.len(), 1);
         assert_eq!(input_blocks[0].output_partition, task.partition_id);
     }
+}
+
+#[test]
+fn cancellation_accepts_in_flight_start_without_releasing_the_slot() {
+    let mut coordinator = coordinator(100, 200, 2);
+    coordinator.submit_stage(stage(0, vec![], 1)).unwrap();
+    register(&mut coordinator, "worker", 1, 0);
+    let (_, task, worker) = assignment(&mut coordinator, 0);
+    coordinator
+        .cancel_query(query_id(), "cancel during start")
+        .unwrap();
+    coordinator
+        .handle_worker_message(
+            WorkerMessage::TaskUpdate {
+                version: PROTOCOL_VERSION,
+                worker_id: WorkerId::new(&worker).unwrap(),
+                task: task.clone(),
+                state: TaskState::Running { started_at_ms: 0 },
+            },
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        coordinator.worker_available_slots(&WorkerId::new(&worker).unwrap()),
+        Some(0)
+    );
+    assert_eq!(
+        coordinator
+            .partition_status(&query_id(), StageId(0), PartitionId(0))
+            .unwrap(),
+        PartitionStatus::Cancelling { attempt: 0 }
+    );
+    succeed(&mut coordinator, &worker, task, 2, vec![]);
+    assert_eq!(
+        coordinator.worker_available_slots(&WorkerId::new(&worker).unwrap()),
+        Some(1)
+    );
+    assert_eq!(
+        coordinator
+            .partition_status(&query_id(), StageId(0), PartitionId(0))
+            .unwrap(),
+        PartitionStatus::Cancelled
+    );
 }

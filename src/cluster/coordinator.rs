@@ -739,6 +739,19 @@ impl Coordinator {
             .get_mut(&key)
             .ok_or_else(|| stage_not_found(&task.query_id, task.stage_id))?;
         task.validate_for(&stage.plan)?;
+        // Distinguish retired attempts from malformed/unauthorized updates. Workers may receive
+        // this after an in-flight RPC crosses a lease expiration or query cancellation.
+        let superseded = match &stage.partitions[partition_index] {
+            PartitionRuntime::Pending { next_attempt } => task.attempt < *next_attempt,
+            PartitionRuntime::Active { task: current, .. }
+            | PartitionRuntime::Cancelling { task: current, .. }
+            | PartitionRuntime::Succeeded { task: current, .. } => task.attempt < current.attempt,
+            PartitionRuntime::Failed { attempt, .. } => task.attempt <= *attempt,
+            PartitionRuntime::Cancelled => true,
+        };
+        if superseded {
+            return Err(SparkXError::TaskSuperseded);
+        }
         if let (Some(exchange), TaskState::Succeeded { output_blocks, .. }) =
             (&stage.plan.output_exchange, &state)
         {
@@ -783,10 +796,11 @@ impl Coordinator {
                 TaskState::Succeeded { finished_at_ms, .. }
                 | TaskState::Failed { finished_at_ms, .. }
                 | TaskState::Cancelled { finished_at_ms, .. } => finished_at_ms,
-                TaskState::Running { .. } => {
-                    return Err(coordinator_error(
-                        "a cancelling task only accepts a terminal update",
-                    ));
+                TaskState::Running { started_at_ms } => {
+                    validate_reported_time("started", started_at_ms, lease, received_at_ms)?;
+                    // Acknowledge an already in-flight start report without undoing cancellation
+                    // or freeing its slot. The worker will acknowledge cancellation terminally.
+                    return Ok(());
                 }
             };
             validate_reported_time("finished", finished_at_ms, lease, received_at_ms)?;
